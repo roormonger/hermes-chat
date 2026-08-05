@@ -58,7 +58,13 @@ logger = logging.getLogger("hermes_chat")
 # Gateway backend selection: prefer tui_gateway (in-process JSON-RPC) over
 # the legacy PTY path. Both expose the same interface to the REST layer.
 # ---------------------------------------------------------------------------
-from .gateway_session import gateway_available, gateway_available_error, GatewaySessionManager, _translate_event
+from .gateway_session import (
+    gateway_available,
+    gateway_available_error,
+    GatewaySessionManager,
+    HERMES_CHAT_SOURCE,
+    _translate_event,
+)
 
 if gateway_available():
     logger.info("tui_gateway available — using in-process JSON-RPC backend")
@@ -211,6 +217,19 @@ class ImageAttachRequest(BaseModel):
     chat_id: str
     content_base64: str
     filename: str = ""
+
+
+class PdfAttachRequest(BaseModel):
+    chat_id: str
+    content_base64: str
+    filename: str = "uploaded.pdf"
+
+
+class FileAttachRequest(BaseModel):
+    chat_id: str
+    data_url: str
+    filename: str = ""
+    path: str = ""
 
 
 class LoginRequest(BaseModel):
@@ -551,11 +570,85 @@ async def image_attach(request: ImageAttachRequest, current_user: dict = Depends
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if gw.hermes_session_id and gw.hermes_session_id != hermes_sid:
+        store.set_hermes_session_id(request.chat_id, gw.hermes_session_id)
+    return result
+
+
+@app.post("/v1/pdf/attach")
+async def pdf_attach(request: PdfAttachRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Render a PDF to vision tiles (pdf.attach). Falls back to file.attach if pdftoppm is missing."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="PDF attachment requires gateway backend")
+    if not request.chat_id.strip():
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    if not request.content_base64.strip():
+        raise HTTPException(status_code=400, detail="content_base64 is required")
+    _verify_chat_access(request.chat_id, current_user)
+    loop = asyncio.get_running_loop()
+    hermes_sid = store.get_hermes_session_id(request.chat_id)
+    gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    filename = request.filename or "uploaded.pdf"
+    try:
+        result = await loop.run_in_executor(
+            None, gw.attach_pdf, request.content_base64, filename
+        )
+    except Exception as exc:
+        msg = str(exc)
+        # No poppler → stage as a regular @file: so the agent can still read it.
+        if "pdftoppm" in msg.lower():
+            data_url = request.content_base64
+            if not data_url.startswith("data:"):
+                data_url = f"data:application/pdf;base64,{data_url}"
+            try:
+                result = await loop.run_in_executor(
+                    None, gw.attach_file, data_url, filename, filename
+                )
+                result = {**result, "fallback": "file.attach", "pdf_render_error": msg}
+            except Exception as fallback_exc:
+                raise HTTPException(status_code=500, detail=str(fallback_exc)) from fallback_exc
+        else:
+            raise HTTPException(status_code=500, detail=msg) from exc
+    if gw.hermes_session_id and gw.hermes_session_id != hermes_sid:
+        store.set_hermes_session_id(request.chat_id, gw.hermes_session_id)
+    return result
+
+
+@app.post("/v1/file/attach")
+async def file_attach(request: FileAttachRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Stage a non-image file into the session workspace (file.attach → @file: ref)."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="File attachment requires gateway backend")
+    if not request.chat_id.strip():
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    if not request.data_url.strip():
+        raise HTTPException(status_code=400, detail="data_url is required")
+    _verify_chat_access(request.chat_id, current_user)
+    loop = asyncio.get_running_loop()
+    hermes_sid = store.get_hermes_session_id(request.chat_id)
+    gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        result = await loop.run_in_executor(
+            None,
+            gw.attach_file,
+            request.data_url,
+            request.filename,
+            request.path or request.filename,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if gw.hermes_session_id and gw.hermes_session_id != hermes_sid:
+        store.set_hermes_session_id(request.chat_id, gw.hermes_session_id)
     return result
 
 
 class CancelRequest(BaseModel):
     chat_id: str
+
+
+class SteerRequest(BaseModel):
+    chat_id: str
+    text: str
 
 
 @app.post("/v1/chat/cancel")
@@ -576,18 +669,223 @@ async def cancel_chat(request: CancelRequest, current_user: dict = Depends(get_c
     return {"status": "interrupted"}
 
 
-@app.post("/v1/chat/undo")
-async def undo_chat(request: CancelRequest, current_user: dict = Depends(get_current_user)) -> dict:
-    """Undo the last user/assistant turn for a chat session."""
+@app.post("/v1/chat/steer")
+async def steer_chat(request: SteerRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Inject a mid-turn correction into the active Hermes turn (session.steer)."""
     if _BACKEND != "gateway":
-        raise HTTPException(status_code=400, detail="Undo requires gateway backend")
+        raise HTTPException(status_code=400, detail="Steer requires gateway backend")
     _verify_chat_access(request.chat_id, current_user)
+    text = (request.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
     loop = asyncio.get_running_loop()
     gw = sessions.get(request.chat_id)  # type: ignore[attr-defined]
-    if gw is not None:
-        await loop.run_in_executor(None, gw.session_undo)
-    deleted = history.delete_last_turn(request.chat_id, current_user["user_id"])
-    return {"status": "ok", "deleted": deleted}
+    if gw is None:
+        hermes_sid = store.get_hermes_session_id(request.chat_id)
+        if not hermes_sid:
+            raise HTTPException(status_code=404, detail="No active session to steer")
+        gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        result = await loop.run_in_executor(None, gw.steer, text)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": result.get("status", "queued"), "text": result.get("text", text)}
+
+
+class SlashCommandRequest(BaseModel):
+    chat_id: str
+    command: str
+
+
+@app.get("/v1/chat/commands")
+async def list_commands(
+    chat_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Return Hermes slash-command catalog (commands.catalog)."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Commands require gateway backend")
+    loop = asyncio.get_running_loop()
+    if chat_id:
+        _verify_chat_access(chat_id, current_user)
+        hermes_sid = store.get_hermes_session_id(chat_id)
+        gw = sessions.get_or_create(chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    else:
+        gw = sessions.get_or_create(_MODEL_CATALOG_CHAT_ID, None, loop)  # type: ignore[attr-defined]
+    try:
+        catalog = await loop.run_in_executor(None, gw.commands_catalog)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return catalog
+
+
+@app.post("/v1/chat/command")
+async def run_command(request: SlashCommandRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Dispatch a slash command (slash.exec → command.dispatch)."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Commands require gateway backend")
+    _verify_chat_access(request.chat_id, current_user)
+    command = (request.command or "").strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    loop = asyncio.get_running_loop()
+    hermes_sid = store.get_hermes_session_id(request.chat_id)
+    gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        result = await loop.run_in_executor(None, gw.run_slash, command)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Persist hermes_session_id if ensure_session created one during dispatch.
+    if gw.hermes_session_id and gw.hermes_session_id != hermes_sid:
+        store.set_hermes_session_id(request.chat_id, gw.hermes_session_id)
+    return result
+
+
+class CompressRequest(BaseModel):
+    chat_id: str
+    focus_topic: str = ""
+
+
+class BranchRequest(BaseModel):
+    chat_id: str
+    name: str = ""
+
+
+def _last_user_prefill(chat_id: str, user_id: Optional[str]) -> str:
+    """Return the last user message text (for composer prefill after undo)."""
+    msgs = history.get_messages(chat_id, user_id)
+    for msg in reversed(msgs):
+        if msg.get("role") == "user":
+            return str(msg.get("content") or "").strip()
+    return ""
+
+
+def _resync_local_from_hermes(chat_id: str, user_id: Optional[str], gw) -> int:
+    """Replace the local message cache from the live Hermes transcript."""
+    history.delete_messages(chat_id, user_id)
+    hermes_messages = gw.session_history()
+    return _seed_local_messages_from_hermes(chat_id, user_id, hermes_messages)
+
+
+@app.post("/v1/chat/undo")
+async def undo_chat(request: CancelRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Undo the last user/assistant turn (session.undo) and return prefill text."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Undo requires gateway backend")
+    user_id = current_user["user_id"]
+    _verify_chat_access(request.chat_id, current_user)
+    prefill = _last_user_prefill(request.chat_id, user_id)
+    loop = asyncio.get_running_loop()
+    hermes_sid = store.get_hermes_session_id(request.chat_id)
+    gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        undo_result = await loop.run_in_executor(None, gw.session_undo)
+    except RuntimeError as exc:
+        detail = str(exc)
+        status = 409 if "interrupt" in detail.lower() or "running" in detail.lower() else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+    deleted = history.delete_last_turn(request.chat_id, user_id)
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "removed": (undo_result or {}).get("removed"),
+        "prefill": prefill,
+    }
+
+
+@app.post("/v1/chat/compress")
+async def compress_chat(request: CompressRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Manually compact conversation context (session.compress)."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Compress requires gateway backend")
+    user_id = current_user["user_id"]
+    _verify_chat_access(request.chat_id, current_user)
+    loop = asyncio.get_running_loop()
+    hermes_sid = store.get_hermes_session_id(request.chat_id)
+    gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        result = await loop.run_in_executor(
+            None, gw.session_compress, (request.focus_topic or "").strip()
+        )
+    except RuntimeError as exc:
+        detail = str(exc)
+        status = 409 if "interrupt" in detail.lower() or "running" in detail.lower() or "busy" in detail.lower() else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+    if gw.hermes_session_id and gw.hermes_session_id != hermes_sid:
+        store.set_hermes_session_id(request.chat_id, gw.hermes_session_id)
+
+    seeded = await loop.run_in_executor(
+        None, _resync_local_from_hermes, request.chat_id, user_id, gw
+    )
+    return {
+        "status": result.get("status", "ok"),
+        "before_messages": result.get("before_messages"),
+        "after_messages": result.get("after_messages"),
+        "before_tokens": result.get("before_tokens"),
+        "after_tokens": result.get("after_tokens"),
+        "summary": result.get("summary") or result.get("info") or "",
+        "message_count": seeded,
+    }
+
+
+@app.post("/v1/chat/branch")
+async def branch_chat(request: BranchRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    """Fork the current session into a new chat (session.branch)."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Branch requires gateway backend")
+    user_id = current_user["user_id"]
+    _verify_chat_access(request.chat_id, current_user)
+    loop = asyncio.get_running_loop()
+    hermes_sid = store.get_hermes_session_id(request.chat_id)
+    parent_gw = sessions.get_or_create(request.chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        branched = await loop.run_in_executor(
+            None, parent_gw.session_branch, (request.name or "").strip()
+        )
+    except RuntimeError as exc:
+        detail = str(exc)
+        status = 409 if "busy" in detail.lower() or "running" in detail.lower() else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+    new_sid = str(branched.get("session_id") or "").strip()
+    if not new_sid:
+        raise HTTPException(status_code=500, detail="session.branch returned no session_id")
+
+    parent_chat = history.get_chat(request.chat_id, user_id) or {}
+    parent_title = str(parent_chat.get("title") or "Chat").strip() or "Chat"
+    branch_title = str(branched.get("title") or "").strip()
+    if not branch_title:
+        name = (request.name or "").strip()
+        branch_title = name or f"{parent_title} (branch)"
+
+    new_chat_id = str(uuid.uuid4())
+    history.create_chat(new_chat_id, user_id, branch_title)
+    child_gw = sessions.get_or_create(new_chat_id, new_sid, loop)  # type: ignore[attr-defined]
+    try:
+        resumed = await loop.run_in_executor(None, child_gw.session_resume, new_sid)
+    except RuntimeError as exc:
+        history.delete_chat(new_chat_id, user_id)
+        store.delete(new_chat_id)
+        sessions.remove(new_chat_id)  # type: ignore[attr-defined]
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    tip = str(resumed.get("session_id") or child_gw.hermes_session_id or new_sid)
+    store.set_hermes_session_id(new_chat_id, tip)
+    hermes_messages = resumed.get("messages") or []
+    seeded = _seed_local_messages_from_hermes(new_chat_id, user_id, hermes_messages)
+    logger.info(
+        "branched chat %s → %s hermes %s→%s seeded=%d",
+        request.chat_id, new_chat_id, hermes_sid, tip, seeded,
+    )
+    return {
+        "status": "ok",
+        "chat_id": new_chat_id,
+        "title": branch_title,
+        "hermes_session_id": tip,
+        "parent": branched.get("parent") or hermes_sid,
+        "message_count": seeded,
+    }
 
 
 @app.get("/v1/usage")
@@ -951,6 +1249,36 @@ async def ws_gateway(ws: WebSocket) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _seed_local_messages_from_hermes(
+    chat_id: str,
+    user_id: Optional[str],
+    hermes_messages: list[dict],
+) -> int:
+    """Populate an empty local cache from a Hermes session.resume transcript.
+
+    Hermes is the agent SoT; our SQLite is a display/edit cache that needs
+    stable numeric ids. Only user/assistant turns are seeded.
+    """
+    seeded = 0
+    for msg in hermes_messages:
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = msg.get("text") or msg.get("content") or ""
+        if not str(text).strip() and role == "assistant":
+            continue
+        reasoning = msg.get("reasoning") or msg.get("reasoning_content") or None
+        history.add_message(
+            chat_id,
+            user_id,
+            role,
+            str(text),
+            reasoning=str(reasoning) if reasoning else None,
+        )
+        seeded += 1
+    return seeded
+
+
 @app.get("/api/chats")
 async def list_chats(current_user: dict = Depends(get_current_user)) -> list[dict]:
     return history.list_chats(current_user["user_id"])
@@ -978,6 +1306,16 @@ async def rename_chat(chat_id: str, request: RenameChatRequest, current_user: di
         raise HTTPException(status_code=404, detail="Chat not found")
     if request.title is not None:
         history.rename_chat(chat_id, current_user["user_id"], request.title)
+        # Keep Hermes state.db title in sync when this chat is bound to a session.
+        if _BACKEND == "gateway":
+            hermes_sid = store.get_hermes_session_id(chat_id)
+            if hermes_sid:
+                loop = asyncio.get_running_loop()
+                gw = sessions.get_or_create(chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+                try:
+                    await loop.run_in_executor(None, gw.set_title, request.title)
+                except Exception as exc:
+                    logger.warning("chat_id=%s session.title failed: %s", chat_id, exc)
     if request.pinned is not None:
         history.pin_chat(chat_id, current_user["user_id"], request.pinned)
     updated = history.get_chat(chat_id, current_user["user_id"])
@@ -989,14 +1327,212 @@ async def delete_chat(chat_id: str, current_user: dict = Depends(get_current_use
     if history.get_chat(chat_id, current_user["user_id"]) is None:
         raise HTTPException(status_code=404, detail="Chat not found")
     history.delete_chat(chat_id, current_user["user_id"])
+    store.delete(chat_id)
+    if sessions is not None:
+        sessions.remove(chat_id)
     return {"deleted": chat_id}
+
+
+@app.get("/v1/hermes-sessions")
+async def list_hermes_sessions(
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """List Hermes sessions available to import (TUI / CLI / desktop / …).
+
+    Excludes ``hermes-chat`` sessions we created ourselves. Already-imported
+    sessions are included with ``imported: true`` + ``chat_id`` so the picker
+    can grey them out or jump to the existing chat.
+    """
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Import requires gateway backend")
+    loop = asyncio.get_running_loop()
+    gw = sessions.get_or_create(_MODEL_CATALOG_CHAT_ID, None, loop)  # type: ignore[attr-defined]
+    try:
+        raw = await loop.run_in_executor(None, gw.session_list, limit)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    bound = store.list_bound_hermes_session_ids()
+    user_id = current_user["user_id"]
+    out: list[dict] = []
+    for s in raw:
+        sid = str(s.get("id") or "").strip()
+        if not sid:
+            continue
+        source = str(s.get("source") or "").strip().lower()
+        if source == HERMES_CHAT_SOURCE.lower():
+            continue
+        chat_id = bound.get(sid)
+        imported = False
+        if chat_id:
+            chat = history.get_chat(chat_id, user_id)
+            if chat is None:
+                # Orphan binding (deleted chat / other user) — allow re-import.
+                store.delete(chat_id)
+                chat_id = None
+            else:
+                imported = True
+        out.append({
+            "id": sid,
+            "title": str(s.get("title") or "").strip() or "Untitled session",
+            "preview": str(s.get("preview") or "").strip(),
+            "started_at": s.get("started_at") or 0,
+            "message_count": int(s.get("message_count") or 0),
+            "source": source or "unknown",
+            "imported": imported,
+            "chat_id": chat_id if imported else None,
+        })
+    return {"sessions": out}
+
+
+class ImportHermesSessionRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/v1/hermes-sessions/import")
+async def import_hermes_session(
+    request: ImportHermesSessionRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Resume a Hermes session and bind it to a new (or existing) hermes-chat."""
+    if _BACKEND != "gateway":
+        raise HTTPException(status_code=400, detail="Import requires gateway backend")
+    session_id = (request.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    user_id = current_user["user_id"]
+
+    def _existing_for(sid: str) -> Optional[dict]:
+        bound_id = store.find_chat_id_by_hermes_session_id(sid)
+        if not bound_id:
+            return None
+        chat = history.get_chat(bound_id, user_id)
+        if chat is None:
+            store.delete(bound_id)
+            return None
+        return {
+            "chat_id": bound_id,
+            "title": chat.get("title") or "Imported chat",
+            "already_imported": True,
+            "hermes_session_id": sid,
+            "message_count": len(history.get_messages(bound_id, user_id)),
+        }
+
+    already = _existing_for(session_id)
+    if already:
+        return already
+
+    loop = asyncio.get_running_loop()
+    chat_id = str(uuid.uuid4())
+    history.create_chat(chat_id, user_id, "Importing…")
+    gw = sessions.get_or_create(chat_id, session_id, loop)  # type: ignore[attr-defined]
+    try:
+        resumed = await loop.run_in_executor(None, gw.session_resume, session_id)
+    except RuntimeError as exc:
+        history.delete_chat(chat_id, user_id)
+        store.delete(chat_id)
+        sessions.remove(chat_id)  # type: ignore[attr-defined]
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    tip = str(resumed.get("session_id") or gw.hermes_session_id or session_id)
+    tip_existing = _existing_for(tip) if tip != session_id else None
+    if tip_existing:
+        history.delete_chat(chat_id, user_id)
+        store.delete(chat_id)
+        sessions.remove(chat_id)  # type: ignore[attr-defined]
+        return tip_existing
+
+    info = resumed.get("info") if isinstance(resumed.get("info"), dict) else {}
+    title = (
+        (info or {}).get("title")
+        or (info or {}).get("display_name")
+        or resumed.get("title")
+        or ""
+    )
+    title = str(title).strip() or "Imported session"
+    source = str((info or {}).get("source") or resumed.get("source") or "").strip()
+    if source:
+        title_prefix = {
+            "tui": "TUI",
+            "api_server": "API",
+            "cli": "CLI",
+            "desktop": "Desktop",
+            "acp": "ACP",
+        }.get(source.lower(), source)
+        if not title.lower().startswith(f"{title_prefix.lower()}:"):
+            title = f"{title_prefix}: {title}"
+
+    history.rename_chat(chat_id, user_id, title)
+    store.set_hermes_session_id(chat_id, tip)
+
+    hermes_messages = resumed.get("messages") or []
+    seeded = _seed_local_messages_from_hermes(chat_id, user_id, hermes_messages)
+    logger.info(
+        "imported hermes session %s → chat_id=%s tip=%s seeded=%d",
+        session_id, chat_id, tip, seeded,
+    )
+    return {
+        "chat_id": chat_id,
+        "title": title,
+        "already_imported": False,
+        "hermes_session_id": tip,
+        "message_count": seeded,
+        "source": source or None,
+    }
 
 
 @app.get("/api/chats/{chat_id}/messages")
 async def get_messages(chat_id: str, current_user: dict = Depends(get_current_user)) -> list[dict]:
-    if history.get_chat(chat_id, current_user["user_id"]) is None:
+    user_id = current_user["user_id"]
+    if history.get_chat(chat_id, user_id) is None:
         raise HTTPException(status_code=404, detail="Chat not found")
-    return history.get_messages(chat_id, current_user["user_id"])
+
+    local = history.get_messages(chat_id, user_id)
+    if _BACKEND != "gateway":
+        return local
+
+    hermes_sid = store.get_hermes_session_id(chat_id)
+    if not hermes_sid:
+        return local
+
+    # Resume into this gateway process so Hermes remains SoT across restarts.
+    loop = asyncio.get_running_loop()
+    gw = sessions.get_or_create(chat_id, hermes_sid, loop)  # type: ignore[attr-defined]
+    try:
+        resumed = await loop.run_in_executor(None, gw.session_resume, hermes_sid)
+    except Exception as exc:
+        logger.warning("chat_id=%s session.resume on load failed: %s", chat_id, exc)
+        return local
+
+    tip = resumed.get("session_id") or gw.hermes_session_id
+    if tip and tip != hermes_sid:
+        store.set_hermes_session_id(chat_id, str(tip))
+
+    info = resumed.get("info") if isinstance(resumed.get("info"), dict) else {}
+    hermes_title = (
+        (info or {}).get("title")
+        or (info or {}).get("display_name")
+        or resumed.get("title")
+        or ""
+    )
+    if isinstance(hermes_title, str) and hermes_title.strip():
+        chat = history.get_chat(chat_id, user_id)
+        if chat and chat.get("title") in (None, "", "New chat"):
+            history.rename_chat(chat_id, user_id, hermes_title.strip())
+
+    hermes_messages = resumed.get("messages") or []
+    if not local and hermes_messages:
+        seeded = _seed_local_messages_from_hermes(chat_id, user_id, hermes_messages)
+        if seeded:
+            logger.info(
+                "chat_id=%s seeded %d local messages from Hermes session %s",
+                chat_id, seeded, tip or hermes_sid,
+            )
+            local = history.get_messages(chat_id, user_id)
+
+    return local
 
 
 @app.post("/api/chats/{chat_id}/messages")

@@ -46,6 +46,10 @@ from typing import Any, Optional
 
 logger = logging.getLogger("hermes_chat.gateway")
 
+# Distinct from the built-in TUI default ("tui") so session.list / import can
+# separate hermes-chat conversations from CLI/desktop sessions.
+HERMES_CHAT_SOURCE = "hermes-chat"
+
 # ---------------------------------------------------------------------------
 # Import guard — fail loudly if tui_gateway is not available so the caller
 # can decide whether to fall back to the PTY path.
@@ -79,14 +83,59 @@ def gateway_available_error() -> str:
 # ---------------------------------------------------------------------------
 
 class QueueTransport:
-    """A tui_gateway Transport that pushes JSON-RPC frames onto an asyncio Queue."""
+    """A tui_gateway Transport that pushes JSON-RPC frames onto an asyncio Queue.
+
+    Long-running RPCs (``slash.exec``, ``session.resume``, …) return ``None``
+    from ``dispatch()`` and write the JSON-RPC response asynchronously via
+    ``write()``. Callers that need that result register a waiter with
+    ``begin_wait`` / ``wait_response`` so the matching ``id`` is intercepted
+    instead of being dropped by the SSE event translator.
+    """
 
     def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
         self._queue = queue
         self._loop = loop
+        self._waiters: dict[Any, threading.Event] = {}
+        self._responses: dict[Any, dict] = {}
+        self._wait_lock = threading.Lock()
+
+    def begin_wait(self, rid: Any) -> None:
+        with self._wait_lock:
+            self._waiters[rid] = threading.Event()
+
+    def cancel_wait(self, rid: Any) -> None:
+        with self._wait_lock:
+            self._waiters.pop(rid, None)
+            self._responses.pop(rid, None)
+
+    def wait_response(self, rid: Any, timeout: float = 300.0) -> dict:
+        with self._wait_lock:
+            event = self._waiters.get(rid)
+        if event is None:
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "no waiter"}}
+        if not event.wait(timeout):
+            self.cancel_wait(rid)
+            return {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "error": {"code": -32000, "message": f"RPC timeout after {timeout:.0f}s"},
+            }
+        with self._wait_lock:
+            resp = self._responses.pop(rid, {})
+            self._waiters.pop(rid, None)
+        return resp
 
     # tui_gateway.transport.Transport interface
     def write(self, obj: dict) -> bool:
+        rid = obj.get("id") if isinstance(obj, dict) else None
+        # JSON-RPC responses have an id and no method; events use method=event.
+        if rid is not None and isinstance(obj, dict) and "method" not in obj:
+            with self._wait_lock:
+                event = self._waiters.get(rid)
+                if event is not None:
+                    self._responses[rid] = obj
+                    event.set()
+                    return True
         self._loop.call_soon_threadsafe(self._queue.put_nowait, obj)
         return True
 
@@ -97,6 +146,17 @@ class QueueTransport:
 # ---------------------------------------------------------------------------
 # Event translation: tui_gateway JSON-RPC → our SSE event shape
 # ---------------------------------------------------------------------------
+
+# Desktop / niche surfaces we intentionally do not bridge (see docs).
+_UNSUPPORTED_GATEWAY_EVENTS = frozenset({
+    "terminal.read.request",
+    "agent.terminal.output",
+    "agent.terminal.close",
+    "moa.reference",
+    "moa.aggregating",
+    "review.summary",
+})
+
 
 def _translate_event(frame: dict) -> Optional[dict]:
     """
@@ -128,6 +188,13 @@ def _translate_event(frame: dict) -> Optional[dict]:
             "tool_id": payload.get("tool_id", ""),
             "name": payload.get("name", ""),
             "context": payload.get("context", ""),
+        }
+
+    if etype == "tool.generating":
+        return {
+            "type": "tool_generating",
+            "tool_id": payload.get("tool_id", ""),
+            "name": payload.get("name", ""),
         }
 
     if etype == "tool.progress":
@@ -239,7 +306,37 @@ def _translate_event(frame: dict) -> Optional[dict]:
             "total_tokens": payload.get("total_tokens") or 0,
         }
 
-    # Ignore internal / UI-only frames
+    if etype == "status.update":
+        kind = payload.get("kind") or payload.get("status") or ""
+        text = payload.get("text") or payload.get("message") or ""
+        return {
+            "type": "status_update",
+            "kind": kind,
+            "text": text,
+        }
+
+    if etype == "notification.show":
+        return {
+            "type": "notification",
+            "id": payload.get("id") or payload.get("key") or "",
+            "key": payload.get("key") or "",
+            "text": payload.get("text") or payload.get("message") or "",
+            "level": payload.get("level") or "info",
+        }
+
+    if etype == "notification.clear":
+        return {
+            "type": "notification_clear",
+            "id": payload.get("id") or "",
+            "key": payload.get("key") or "",
+        }
+
+    # Desktop / niche surfaces we intentionally do not bridge (see docs).
+    if etype in _UNSUPPORTED_GATEWAY_EVENTS:
+        return None
+
+    # Keep upgrades discoverable: log at debug without dropping the frame silently.
+    logger.debug("unhandled gateway event type=%s keys=%s", etype, list(payload.keys()) if isinstance(payload, dict) else type(payload))
     return None
 
 
@@ -256,13 +353,31 @@ def _rpc(method: str, params: dict, rid: Any = None) -> dict:
     }
 
 
-def _dispatch_sync(req: dict, transport: "QueueTransport") -> dict:
-    """Call tui_gateway.server.dispatch in a thread-safe way and return the result."""
+def _dispatch_sync(req: dict, transport: "QueueTransport", *, timeout: float = 300.0) -> dict:
+    """Call tui_gateway.server.dispatch and return the JSON-RPC response.
+
+    Fast-path methods return inline. Long handlers (``_LONG_HANDLERS``) schedule
+    work on Hermes' pool and write the response through ``transport`` — we wait
+    for the matching ``id`` so callers always get a real result.
+    """
     from tui_gateway.transport import bind_transport, reset_transport
+    rid = req.get("id")
+    if rid is not None:
+        transport.begin_wait(rid)
     token = bind_transport(transport)
     try:
         result = _gw_server.dispatch(req, transport)
-        return result or {}
+        if result is not None:
+            if rid is not None:
+                transport.cancel_wait(rid)
+            return result
+        if rid is None:
+            return {}
+        return transport.wait_response(rid, timeout=timeout)
+    except Exception:
+        if rid is not None:
+            transport.cancel_wait(rid)
+        raise
     finally:
         reset_transport(token)
 
@@ -330,6 +445,7 @@ class GatewaySession:
         params: dict,
         *,
         expected_error_codes: frozenset[int] | None = None,
+        timeout: float = 300.0,
     ) -> dict:
         """Dispatch a JSON-RPC call in the Hermes thread pool and return the result.
 
@@ -337,7 +453,7 @@ class GatewaySession:
         usage polls). All other RPC errors stay at warning so real bugs remain visible.
         """
         req = _rpc(method, params)
-        result = _dispatch_sync(req, self._transport)
+        result = _dispatch_sync(req, self._transport, timeout=timeout)
         if isinstance(result, dict) and "error" in result:
             code = result["error"].get("code", 0)
             msg = result["error"].get("message", "unknown")
@@ -361,33 +477,152 @@ class GatewaySession:
                 # None means "known empty" — create on next ensure_session.
                 self._session_verified = True
 
+    def _apply_resumed_session(self, requested_sid: str, data: dict) -> str:
+        """Update local binding after a successful session.resume (tip may differ)."""
+        tip = (
+            data.get("session_id")
+            or data.get("resumed")
+            or requested_sid
+        )
+        tip = str(tip)
+        with self._lock:
+            self.hermes_session_id = tip
+            self._session_verified = True
+        if tip != requested_sid:
+            logger.info(
+                "chat_id=%s resume tip session_id=%s (requested %s)",
+                self.chat_id, tip, requested_sid,
+            )
+        return tip
+
+    def session_resume(self, session_id: Optional[str] = None) -> dict:
+        """Load a saved Hermes session into this gateway process (Hermes SoT).
+
+        Prefer this over session.create when we already have a hermes_session_id
+        from our chat↔session map — otherwise a gateway restart would orphan the
+        real transcript and invent an empty session.
+        """
+        self.last_active = time.monotonic()
+        sid = session_id or self.hermes_session_id
+        if not sid:
+            return {}
+        result = self._call(
+            "session.resume",
+            {"session_id": sid},
+            expected_error_codes=frozenset({4001, 4007}),
+        )
+        if isinstance(result, dict) and "error" in result:
+            code = result["error"].get("code")
+            msg = result["error"].get("message", "session.resume failed")
+            logger.warning("chat_id=%s session.resume(%s) error %s: %s", self.chat_id, sid, code, msg)
+            raise RuntimeError(msg)
+        data = result.get("result") or {}
+        self._apply_resumed_session(sid, data)
+        return data
+
+    def session_list(self, limit: int = 200) -> list[dict]:
+        """Browse saved Hermes transcripts (session.list) — no live session required."""
+        self.last_active = time.monotonic()
+        capped = max(1, min(int(limit or 200), 500))
+        result = self._call("session.list", {"limit": capped}, timeout=60.0)
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(result["error"].get("message", "session.list failed"))
+        payload = result.get("result") or {}
+        sessions = payload.get("sessions") if isinstance(payload, dict) else None
+        if not isinstance(sessions, list):
+            return []
+        return [s for s in sessions if isinstance(s, dict)]
+
+    def session_history(self) -> list[dict]:
+        """Return normalized transcript messages from the live Hermes session."""
+        self.last_active = time.monotonic()
+        sid = self.hermes_session_id
+        if not sid:
+            return []
+        result = self._call(
+            "session.history",
+            {"session_id": sid},
+            expected_error_codes=frozenset({4001}),
+        )
+        if isinstance(result, dict) and result.get("error", {}).get("code") == 4001:
+            # Not live — resume from state.db then history is on the resume payload.
+            try:
+                data = self.session_resume(sid)
+            except RuntimeError:
+                return []
+            return list(data.get("messages") or [])
+        if isinstance(result, dict) and "error" in result:
+            return []
+        return list((result.get("result") or {}).get("messages") or [])
+
+    def set_title(self, title: str) -> dict:
+        """Set the Hermes session title (state.db), mirroring TUI /title."""
+        self.last_active = time.monotonic()
+        sid = self.hermes_session_id
+        if not sid:
+            return {}
+        cleaned = (title or "").strip()
+        if not cleaned:
+            return {}
+        result = self._call(
+            "session.title",
+            {"session_id": sid, "title": cleaned},
+            expected_error_codes=frozenset({4001}),
+        )
+        if isinstance(result, dict) and "error" in result:
+            if result["error"].get("code") == 4001:
+                self._mark_session_missing(sid)
+            raise RuntimeError(result["error"].get("message", "session.title failed"))
+        return result.get("result") or {}
+
     # ------------------------------------------------------------------
     def ensure_session(self) -> str:
-        """Return the Hermes session_id, creating one via the gateway if needed.
+        """Return the Hermes session_id, resuming or creating via the gateway.
 
-        If the stored session_id is stale (gateway restarted, session reaped),
-        a new session is created transparently.
+        Prefer ``session.resume`` for stored ids so Hermes ``state.db`` remains
+        the source of truth across gateway/process restarts. Only create a new
+        session when there is no id or resume cannot find one.
         """
         with self._lock:
             if self.hermes_session_id:
                 if self._session_verified:
                     return self.hermes_session_id
-                # DB-loaded session — probe once to confirm it's still live.
+                stale_sid = self.hermes_session_id
+                # DB-loaded session — probe once; if not live, resume from state.db.
                 probe = self._call(
                     "session.info",
-                    {"session_id": self.hermes_session_id},
+                    {"session_id": stale_sid},
                     expected_error_codes=frozenset({4001}),
                 )
                 if not (isinstance(probe, dict) and probe.get("error", {}).get("code") == 4001):
                     self._session_verified = True
+                    return stale_sid
+                logger.info(
+                    "chat_id=%s stored session_id=%s not live in gateway; resuming from Hermes",
+                    self.chat_id, stale_sid,
+                )
+                resumed = self._call(
+                    "session.resume",
+                    {"session_id": stale_sid},
+                    expected_error_codes=frozenset({4001, 4007}),
+                )
+                if isinstance(resumed, dict) and "error" not in resumed:
+                    data = resumed.get("result") or {}
+                    tip = data.get("session_id") or data.get("resumed") or stale_sid
+                    self.hermes_session_id = str(tip)
+                    self._session_verified = True
+                    logger.info(
+                        "chat_id=%s resumed hermes session_id=%s",
+                        self.chat_id, self.hermes_session_id,
+                    )
                     return self.hermes_session_id
                 logger.warning(
-                    "chat_id=%s stored session_id=%s no longer exists in gateway, recreating",
-                    self.chat_id, self.hermes_session_id,
+                    "chat_id=%s resume failed for %s; creating a new Hermes session",
+                    self.chat_id, stale_sid,
                 )
                 self.hermes_session_id = None
 
-            result = self._call("session.create", {})
+            result = self._call("session.create", {"source": HERMES_CHAT_SOURCE})
             sid = (result.get("result") or {}).get("session_id") or \
                   (result.get("result") or {}).get("id") or ""
             if not sid:
@@ -395,7 +630,10 @@ class GatewaySession:
                 raise RuntimeError("Failed to create Hermes session: no session_id in response")
             self.hermes_session_id = sid
             self._session_verified = True
-            logger.info("chat_id=%s created hermes session_id=%s", self.chat_id, sid)
+            logger.info(
+                "chat_id=%s created hermes session_id=%s source=%s",
+                self.chat_id, sid, HERMES_CHAT_SOURCE,
+            )
             return sid
 
     # ------------------------------------------------------------------
@@ -404,40 +642,85 @@ class GatewaySession:
         self.last_active = time.monotonic()
         sid = self.ensure_session()
         result = self._call("prompt.submit", {"session_id": sid, "text": text})
-        # 4001 = session not found (e.g. Hermes Chat restarted, in-memory state wiped)
-        # Reset and recreate the session, then retry once.
+        # 4001 = session not found in this process — resume from Hermes, then retry.
         if isinstance(result, dict) and result.get("error", {}).get("code") == 4001:
             logger.warning(
-                "chat_id=%s session %s not found in gateway, recreating", self.chat_id, sid
+                "chat_id=%s session %s not found in gateway, attempting resume",
+                self.chat_id, sid,
             )
-            with self._lock:
-                self.hermes_session_id = None
-            sid = self.ensure_session()
-            result = self._call("prompt.submit", {"session_id": sid, "text": text})
+            try:
+                data = self.session_resume(sid)
+                sid = data.get("session_id") or self.hermes_session_id or sid
+                result = self._call("prompt.submit", {"session_id": sid, "text": text})
+            except RuntimeError:
+                with self._lock:
+                    self.hermes_session_id = None
+                    self._session_verified = True
+                sid = self.ensure_session()
+                result = self._call("prompt.submit", {"session_id": sid, "text": text})
         if isinstance(result, dict) and "error" in result:
             raise RuntimeError(result["error"].get("message", "prompt.submit failed"))
 
     # ------------------------------------------------------------------
     def attach_image_bytes(self, content_base64: str, filename: str = "") -> dict:
         """Attach an image to the session from base64 data (before prompt.submit)."""
+        return self._attach_rpc(
+            "image.attach_bytes",
+            {"content_base64": content_base64, "filename": filename or ""},
+        )
+
+    def attach_pdf(self, content_base64: str, filename: str = "") -> dict:
+        """Render a PDF to vision tiles via pdf.attach (needs pdftoppm)."""
+        return self._attach_rpc(
+            "pdf.attach",
+            {
+                "content_base64": content_base64,
+                "filename": filename or "uploaded.pdf",
+            },
+            timeout=180.0,
+        )
+
+    def attach_file(self, data_url: str, filename: str = "", path: str = "") -> dict:
+        """Stage a non-image file and return an @file: ref for the prompt."""
+        params: dict[str, str] = {"data_url": data_url}
+        if filename:
+            params["name"] = filename
+        if path:
+            params["path"] = path
+        elif filename:
+            params["path"] = filename  # naming hint when no client path exists
+        return self._attach_rpc("file.attach", params)
+
+    def _attach_rpc(
+        self,
+        method: str,
+        params: dict,
+        *,
+        timeout: float = 120.0,
+    ) -> dict:
+        """Call an attach RPC, resuming/recreating the session on stale 4001."""
         self.last_active = time.monotonic()
         sid = self.ensure_session()
-        logger.debug("chat_id=%s attach_image_bytes using session_id=%s", self.chat_id, sid)
-        params = {"session_id": sid, "content_base64": content_base64, "filename": filename}
-        result = self._call("image.attach_bytes", params)
-        logger.debug("chat_id=%s attach_image_bytes result=%r", self.chat_id, result)
+        call_params = {**params, "session_id": sid}
+        logger.debug("chat_id=%s %s using session_id=%s", self.chat_id, method, sid)
+        result = self._call(method, call_params, timeout=timeout)
         if isinstance(result, dict) and result.get("error", {}).get("code") == 4001:
             logger.warning(
-                "chat_id=%s session %s not found in gateway during image attach, recreating",
-                self.chat_id, sid,
+                "chat_id=%s session %s not found during %s, attempting resume",
+                self.chat_id, sid, method,
             )
-            with self._lock:
-                self.hermes_session_id = None
-            sid = self.ensure_session()
-            params["session_id"] = sid
-            result = self._call("image.attach_bytes", params)
+            try:
+                data = self.session_resume(sid)
+                sid = data.get("session_id") or self.hermes_session_id or sid
+            except RuntimeError:
+                with self._lock:
+                    self.hermes_session_id = None
+                    self._session_verified = True
+                sid = self.ensure_session()
+            call_params["session_id"] = sid
+            result = self._call(method, call_params, timeout=timeout)
         if isinstance(result, dict) and "error" in result:
-            raise RuntimeError(result["error"].get("message", "image.attach_bytes failed"))
+            raise RuntimeError(result["error"].get("message", f"{method} failed"))
         return (result.get("result") or {})
 
     # ------------------------------------------------------------------
@@ -456,21 +739,219 @@ class GatewaySession:
         else:
             logger.info("chat_id=%s session.interrupt sent", self.chat_id)
 
+    def steer(self, text: str) -> dict:
+        """Inject a mid-turn correction without interrupting (session.steer).
+
+        Lands on the next tool-result batch so the model course-corrects on its
+        following iteration — same surface as the TUI/desktop steer affordance.
+        """
+        self.last_active = time.monotonic()
+        cleaned = (text or "").strip()
+        if not cleaned:
+            raise RuntimeError("steer text is required")
+        sid = self.hermes_session_id
+        if not sid:
+            raise RuntimeError("no active Hermes session to steer")
+        result = self._call(
+            "session.steer",
+            {"session_id": sid, "text": cleaned},
+            expected_error_codes=frozenset({4001, 4010}),
+        )
+        if isinstance(result, dict) and "error" in result:
+            code = result["error"].get("code", 0)
+            msg = result["error"].get("message", "session.steer failed")
+            logger.warning("chat_id=%s session.steer error %s: %s", self.chat_id, code, msg)
+            raise RuntimeError(msg)
+        data = result.get("result") or {}
+        logger.info(
+            "chat_id=%s session.steer status=%s",
+            self.chat_id, data.get("status"),
+        )
+        return data
+
+    # ------------------------------------------------------------------
+    def commands_catalog(self) -> dict:
+        """Return Hermes slash-command catalog (commands.catalog)."""
+        self.last_active = time.monotonic()
+        result = self._call("commands.catalog", {})
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(result["error"].get("message", "commands.catalog failed"))
+        return result.get("result") or {}
+
+    def run_slash(self, command: str, *, _depth: int = 0) -> dict:
+        """Run a slash command via slash.exec, falling back to command.dispatch.
+
+        Mirrors the TUI/desktop client path. Returns a normalized action dict:
+
+        - ``{"action": "output", "text": "..."}`` — render inline (no agent turn)
+        - ``{"action": "send"|"skill", "message": "...", "name"?, "notice"?}`` — submit as prompt
+        - ``{"action": "prefill", "message": "...", "notice"?}`` — drop into composer
+        """
+        self.last_active = time.monotonic()
+        if _depth > 8:
+            raise RuntimeError("slash alias loop")
+        raw = (command or "").strip()
+        if not raw:
+            raise RuntimeError("empty command")
+        if not raw.startswith("/"):
+            raw = "/" + raw
+
+        # Ensure we have a live Hermes session — slash.exec needs session_id.
+        sid = self.ensure_session()
+
+        body = raw[1:]  # slash.exec wants no leading slash
+        parts = body.split(None, 1)
+        name = (parts[0] if parts else "").strip()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not name:
+            raise RuntimeError("empty command")
+
+        def _as_dispatch(payload: Any) -> Optional[dict]:
+            if not isinstance(payload, dict):
+                return None
+            dtype = payload.get("type")
+            if dtype in ("exec", "plugin"):
+                return {"action": "output", "text": str(payload.get("output") or "(no output)")}
+            if dtype == "alias":
+                target = str(payload.get("target") or "").lstrip("/")
+                if not target:
+                    return {"action": "output", "text": "empty alias target"}
+                return self.run_slash(f"/{target}" + (f" {arg}" if arg else ""), _depth=_depth + 1)
+            if dtype == "skill":
+                return {
+                    "action": "skill",
+                    "name": str(payload.get("name") or name),
+                    "message": str(payload.get("message") or ""),
+                    "notice": str(payload.get("notice") or "") or None,
+                }
+            if dtype == "send":
+                return {
+                    "action": "send",
+                    "message": str(payload.get("message") or ""),
+                    "notice": str(payload.get("notice") or "") or None,
+                }
+            if dtype == "prefill":
+                return {
+                    "action": "prefill",
+                    "message": str(payload.get("message") or ""),
+                    "notice": str(payload.get("notice") or "") or None,
+                }
+            return None
+
+        # Prefer slash.exec (worker + side-effect mirror). Fall back to
+        # command.dispatch for skills / structured directives.
+        exec_result = self._call(
+            "slash.exec",
+            {"session_id": sid, "command": body},
+            expected_error_codes=frozenset({4001, 4018, 5030}),
+            timeout=600.0,
+        )
+        if isinstance(exec_result, dict) and "error" not in exec_result:
+            payload = exec_result.get("result") or {}
+            dispatch = _as_dispatch(payload)
+            if dispatch is not None:
+                return dispatch
+            if isinstance(payload, dict) and "output" in payload:
+                text = str(payload.get("output") or f"/{name}: no output")
+                warning = payload.get("warning")
+                if warning:
+                    text = f"warning: {warning}\n{text}"
+                return {"action": "output", "text": text}
+
+        # Fall through to command.dispatch (skills, aliases, quick commands).
+        dispatch_result = self._call(
+            "command.dispatch",
+            {"session_id": sid, "name": name, "arg": arg},
+            expected_error_codes=frozenset({4001, 4004, 4011, 4018}),
+        )
+        if isinstance(dispatch_result, dict) and "error" in dispatch_result:
+            # Prefer the original slash.exec error if dispatch also failed.
+            if isinstance(exec_result, dict) and "error" in exec_result:
+                msg = exec_result["error"].get("message", "slash.exec failed")
+            else:
+                msg = dispatch_result["error"].get("message", "command.dispatch failed")
+            raise RuntimeError(msg)
+
+        payload = dispatch_result.get("result") or {}
+        dispatch = _as_dispatch(payload)
+        if dispatch is not None:
+            return dispatch
+        if isinstance(payload, dict) and "output" in payload:
+            return {"action": "output", "text": str(payload.get("output") or "(no output)")}
+        raise RuntimeError(f"/{name}: unrecognized command response")
+
     # ------------------------------------------------------------------
     def session_undo(self) -> dict:
         """Undo the last turn in the Hermes session."""
         self.last_active = time.monotonic()
-        sid = self.hermes_session_id
-        if not sid:
-            return {"status": "no_session"}
-        result = self._call("session.undo", {"session_id": sid})
+        sid = self.ensure_session()
+        result = self._call(
+            "session.undo",
+            {"session_id": sid},
+            expected_error_codes=frozenset({4001, 4009}),
+        )
         if isinstance(result, dict) and "error" in result:
             code = result["error"].get("code", 0)
             msg = result["error"].get("message", "session.undo failed")
             logger.warning("chat_id=%s session.undo error %s: %s", self.chat_id, code, msg)
             raise RuntimeError(msg)
-        logger.info("chat_id=%s session.undo sent", self.chat_id)
-        return result.get("result") or {"status": "ok"}
+        data = result.get("result") or {"status": "ok"}
+        logger.info("chat_id=%s session.undo removed=%s", self.chat_id, data.get("removed"))
+        return data
+
+    def session_compress(self, focus_topic: str = "") -> dict:
+        """Manually compact conversation context (session.compress)."""
+        self.last_active = time.monotonic()
+        sid = self.ensure_session()
+        params: dict = {"session_id": sid}
+        topic = (focus_topic or "").strip()
+        if topic:
+            params["focus_topic"] = topic
+        result = self._call(
+            "session.compress",
+            params,
+            expected_error_codes=frozenset({4001, 4009}),
+            timeout=600.0,
+        )
+        if isinstance(result, dict) and "error" in result:
+            msg = result["error"].get("message", "session.compress failed")
+            logger.warning("chat_id=%s session.compress error: %s", self.chat_id, msg)
+            raise RuntimeError(msg)
+        data = result.get("result") or {}
+        logger.info(
+            "chat_id=%s session.compress %s→%s msgs tokens %s→%s",
+            self.chat_id,
+            data.get("before_messages"),
+            data.get("after_messages"),
+            data.get("before_tokens"),
+            data.get("after_tokens"),
+        )
+        return data
+
+    def session_branch(self, name: str = "") -> dict:
+        """Fork the current session into a new Hermes session (session.branch)."""
+        self.last_active = time.monotonic()
+        sid = self.ensure_session()
+        params: dict = {"session_id": sid}
+        cleaned = (name or "").strip()
+        if cleaned:
+            params["name"] = cleaned
+        result = self._call(
+            "session.branch",
+            params,
+            expected_error_codes=frozenset({4001, 4008, 4090}),
+            timeout=120.0,
+        )
+        if isinstance(result, dict) and "error" in result:
+            msg = result["error"].get("message", "session.branch failed")
+            logger.warning("chat_id=%s session.branch error: %s", self.chat_id, msg)
+            raise RuntimeError(msg)
+        data = result.get("result") or {}
+        logger.info(
+            "chat_id=%s session.branch → %s title=%r",
+            self.chat_id, data.get("session_id"), data.get("title"),
+        )
+        return data
 
     # ------------------------------------------------------------------
     def model_options(self, *, explicit_only: bool = True, include_unauthenticated: bool = False) -> dict:

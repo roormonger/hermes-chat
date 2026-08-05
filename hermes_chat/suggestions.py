@@ -377,7 +377,7 @@ def generate_pool_for_user(
             except Exception:
                 pass
             raise RuntimeError("suggestion generation hit a gate; aborted")
-        elif etype in ("tool_start", "tool_progress"):
+        elif etype in ("tool_start", "tool_progress", "tool_generating"):
             try:
                 gw.interrupt()
             except Exception:

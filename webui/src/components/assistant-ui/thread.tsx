@@ -56,10 +56,12 @@ import {
   Volume2Icon,
   VolumeXIcon,
   WrenchIcon,
+  GitBranchIcon,
+  Minimize2Icon,
 } from "lucide-react";
 import { type FC, type ReactNode, useState, useCallback, useEffect, useRef, Children, createContext, useContext, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { getToken } from "../../api";
+import { getToken, type SlashCommandEntry } from "../../api";
 import { useVoiceRecorder } from "../../hooks/useVoiceRecorder";
 import type { VoiceCapabilities } from "../../hooks/useVoiceCapabilities";
 
@@ -72,6 +74,7 @@ export type StarterSuggestion = {
 };
 
 const StarterSuggestionsContext = createContext<StarterSuggestion[]>([]);
+const SlashCommandsContext = createContext<SlashCommandEntry[]>([]);
 
 type GateContextValue = {
   gatePending: boolean;
@@ -83,23 +86,24 @@ const GateContext = createContext<GateContextValue>({ gatePending: false, onGate
 // Slash command autocomplete
 // ---------------------------------------------------------------------------
 
-const SLASH_COMMANDS = [
-  { command: "/clear",    description: "Clear and start a new conversation" },
+const FALLBACK_SLASH_COMMANDS: SlashCommandEntry[] = [
+  { command: "/clear", description: "Clear and start a new conversation" },
   { command: "/compress", description: "Compress context (optionally: /compress <topic>)" },
-  { command: "/model",    description: "Switch model (e.g. /model gpt-4o)" },
-  { command: "/usage",    description: "Show token usage for this session" },
-  { command: "/help",     description: "Show available slash commands" },
+  { command: "/model", description: "Switch model (e.g. /model gpt-4o)" },
+  { command: "/usage", description: "Show token usage for this session" },
+  { command: "/help", description: "Show available slash commands" },
 ];
 
 const SlashCommandMenu: FC<{
   query: string;
+  commands: SlashCommandEntry[];
   onSelect: (command: string) => void;
   activeIndex: number;
   setActiveIndex: (i: number) => void;
-}> = ({ query, onSelect, activeIndex, setActiveIndex }) => {
+}> = ({ query, commands, onSelect, activeIndex, setActiveIndex }) => {
   const matches = useMemo(
-    () => SLASH_COMMANDS.filter((c) => c.command.startsWith(query.toLowerCase())),
-    [query]
+    () => commands.filter((c) => c.command.toLowerCase().startsWith(query.toLowerCase())).slice(0, 12),
+    [commands, query]
   );
 
   useEffect(() => {
@@ -109,7 +113,7 @@ const SlashCommandMenu: FC<{
   if (matches.length === 0) return null;
 
   return (
-    <div className="absolute bottom-full left-0 mb-1 z-50 w-72 rounded-lg border border-border bg-popover shadow-lg overflow-hidden">
+    <div className="absolute bottom-full left-0 mb-1 z-50 w-80 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover shadow-lg">
       {matches.map((c, i) => (
         <button
           key={c.command}
@@ -122,7 +126,7 @@ const SlashCommandMenu: FC<{
           )}
         >
           <span className="font-mono font-medium">{c.command}</span>
-          <span className="text-xs text-muted-foreground">{c.description}</span>
+          <span className="text-xs text-muted-foreground line-clamp-2">{c.description}</span>
         </button>
       ))}
     </div>
@@ -290,6 +294,8 @@ const isNewChatView = (s: AssistantState) =>
 
 export const Thread: FC<{
   onUndo?: () => void;
+  onCompress?: () => void;
+  onBranch?: () => void;
   contextWindow?: number;
   threadUsage?: ThreadTokenUsage;
   autoSpeak?: boolean;
@@ -299,8 +305,13 @@ export const Thread: FC<{
   gatePending?: boolean;
   onGateChoice?: (choice: string) => Promise<boolean>;
   starterSuggestions?: StarterSuggestion[];
+  slashCommands?: SlashCommandEntry[];
+  composerDraft?: string | null;
+  onComposerDraftConsumed?: () => void;
 }> = ({
   onUndo,
+  onCompress,
+  onBranch,
   contextWindow,
   threadUsage,
   autoSpeak,
@@ -310,12 +321,17 @@ export const Thread: FC<{
   gatePending = false,
   onGateChoice,
   starterSuggestions = [],
+  slashCommands = [],
+  composerDraft = null,
+  onComposerDraftConsumed,
 }) => {
   const caps = { ...(voiceCaps ?? { ttsAvailable: true, sttAvailable: true }), ttsVoice };
   const isEmpty = useAuiState(isNewChatView);
+  const commands = slashCommands.length > 0 ? slashCommands : FALLBACK_SLASH_COMMANDS;
 
   return (
     <StarterSuggestionsContext.Provider value={starterSuggestions}>
+    <SlashCommandsContext.Provider value={commands}>
     <GateContext.Provider value={{ gatePending, onGateChoice: onGateChoice ?? null }}>
     <VoiceCapsContext.Provider value={caps}>
     <ThreadPrimitive.Root
@@ -364,7 +380,17 @@ export const Thread: FC<{
             )}
           >
             <ThreadScrollToBottom />
-            <Composer onUndo={onUndo} contextWindow={contextWindow} threadUsage={threadUsage} autoSpeak={autoSpeak} onAutoSpeakToggle={onAutoSpeakToggle} />
+            <Composer
+              onUndo={onUndo}
+              onCompress={onCompress}
+              onBranch={onBranch}
+              contextWindow={contextWindow}
+              threadUsage={threadUsage}
+              autoSpeak={autoSpeak}
+              onAutoSpeakToggle={onAutoSpeakToggle}
+              composerDraft={composerDraft}
+              onComposerDraftConsumed={onComposerDraftConsumed}
+            />
             <AuiIf condition={(s) => isNewChatView(s) && s.composer.isEmpty}>
               <ThreadSuggestions />
             </AuiIf>
@@ -374,6 +400,7 @@ export const Thread: FC<{
     </ThreadPrimitive.Root>
     </VoiceCapsContext.Provider>
     </GateContext.Provider>
+    </SlashCommandsContext.Provider>
     </StarterSuggestionsContext.Provider>
   );
 };
@@ -454,21 +481,37 @@ const ThreadSuggestions: FC = () => {
 
 const Composer: FC<{
   onUndo?: () => void;
+  onCompress?: () => void;
+  onBranch?: () => void;
   contextWindow?: number;
   threadUsage?: ThreadTokenUsage;
   autoSpeak?: boolean;
   onAutoSpeakToggle?: () => void;
-}> = ({ onUndo, contextWindow, threadUsage, autoSpeak, onAutoSpeakToggle }) => {
+  composerDraft?: string | null;
+  onComposerDraftConsumed?: () => void;
+}> = ({ onUndo, onCompress, onBranch, contextWindow, threadUsage, autoSpeak, onAutoSpeakToggle, composerDraft, onComposerDraftConsumed }) => {
+  const aui = useAui();
   const composerRuntime = useComposerRuntime();
   const composerText = useAuiState((s) => s.composer.text);
+  const isRunning = useAuiState((s) => s.thread.isRunning);
   const { gatePending, onGateChoice } = useContext(GateContext);
+  const slashCommands = useContext(SlashCommandsContext);
   const [gateSubmitting, setGateSubmitting] = useState(false);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [slashActive, setSlashActive] = useState(0);
 
+  useEffect(() => {
+    if (!composerDraft) return;
+    composerRuntime.setText(composerDraft);
+    onComposerDraftConsumed?.();
+  }, [composerDraft, composerRuntime, onComposerDraftConsumed]);
+
   const slashMatches = useMemo(
-    () => slashQuery !== null ? SLASH_COMMANDS.filter((c) => c.command.startsWith(slashQuery.toLowerCase())) : [],
-    [slashQuery]
+    () =>
+      slashQuery !== null
+        ? slashCommands.filter((c) => c.command.toLowerCase().startsWith(slashQuery.toLowerCase())).slice(0, 12)
+        : [],
+    [slashCommands, slashQuery]
   );
 
   const applySlashCommand = useCallback((command: string) => {
@@ -486,6 +529,16 @@ const Composer: FC<{
       setGateSubmitting(false);
     }
   }, [composerRuntime, composerText, gatePending, gateSubmitting, onGateChoice]);
+
+  const submitSteer = useCallback(() => {
+    const text = composerText.trim();
+    if (!text || gatePending) return;
+    aui.thread().append({
+      content: [{ type: "text", text }],
+      runConfig: aui.composer().getState().runConfig,
+    });
+    aui.composer().setText("");
+  }, [aui, composerText, gatePending]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (gatePending && e.key === "Enter" && !e.shiftKey) {
@@ -515,6 +568,12 @@ const Composer: FC<{
         return;
       }
     }
+    // While Hermes is running, Enter / Ctrl+Enter steers instead of no-op.
+    if (isRunning && e.key === "Enter" && !e.shiftKey && composerText.trim()) {
+      e.preventDefault();
+      submitSteer();
+      return;
+    }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       composerRuntime.send();
@@ -540,6 +599,7 @@ const Composer: FC<{
           {slashQuery !== null && slashMatches.length > 0 && (
             <SlashCommandMenu
               query={slashQuery}
+              commands={slashCommands}
               onSelect={applySlashCommand}
               activeIndex={slashActive}
               setActiveIndex={setSlashActive}
@@ -547,7 +607,7 @@ const Composer: FC<{
           )}
           <ComposerAttachments />
           <ComposerPrimitive.Input
-            placeholder="Send a message..."
+            placeholder="Send a message…  (/ for commands)"
             className="aui-composer-input placeholder:text-muted-foreground/80 max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none"
             rows={1}
             autoFocus
@@ -555,7 +615,7 @@ const Composer: FC<{
             onKeyDown={handleKeyDown}
             onInput={handleInput}
           />
-          <ComposerAction onUndo={onUndo} contextWindow={contextWindow} threadUsage={threadUsage} autoSpeak={autoSpeak} onAutoSpeakToggle={onAutoSpeakToggle} gatePending={gatePending} gateSubmitting={gateSubmitting} canSubmitGate={composerText.trim().length > 0} onGateSubmit={() => void submitGateChoice()} />
+          <ComposerAction onUndo={onUndo} onCompress={onCompress} onBranch={onBranch} contextWindow={contextWindow} threadUsage={threadUsage} autoSpeak={autoSpeak} onAutoSpeakToggle={onAutoSpeakToggle} gatePending={gatePending} gateSubmitting={gateSubmitting} canSubmitGate={composerText.trim().length > 0} onGateSubmit={() => void submitGateChoice()} onSteer={submitSteer} />
         </div>
       </ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
@@ -564,6 +624,8 @@ const Composer: FC<{
 
 const ComposerAction: FC<{
   onUndo?: () => void;
+  onCompress?: () => void;
+  onBranch?: () => void;
   contextWindow?: number;
   threadUsage?: ThreadTokenUsage;
   autoSpeak?: boolean;
@@ -572,7 +634,8 @@ const ComposerAction: FC<{
   gateSubmitting: boolean;
   canSubmitGate: boolean;
   onGateSubmit: () => void;
-}> = ({ onUndo, contextWindow, threadUsage, autoSpeak, onAutoSpeakToggle, gatePending, gateSubmitting, canSubmitGate, onGateSubmit }) => {
+  onSteer: () => void;
+}> = ({ onUndo, onCompress, onBranch, contextWindow, threadUsage, autoSpeak, onAutoSpeakToggle, gatePending, gateSubmitting, canSubmitGate, onGateSubmit, onSteer }) => {
   const canUndo = useAuiState((s) => s.thread.messages.length > 0);
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const composerRuntime = useComposerRuntime();
@@ -618,6 +681,36 @@ const ComposerAction: FC<{
             usage={threadUsage}
             side="top"
           />
+        )}
+        {onCompress && canUndo && (
+          <TooltipIconButton
+            tooltip="Compress context"
+            side="bottom"
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-7 rounded-full"
+            aria-label="Compress context"
+            onClick={onCompress}
+            disabled={isRunning}
+          >
+            <Minimize2Icon className="size-4" />
+          </TooltipIconButton>
+        )}
+        {onBranch && canUndo && (
+          <TooltipIconButton
+            tooltip="Branch conversation"
+            side="bottom"
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-7 rounded-full"
+            aria-label="Branch conversation"
+            onClick={onBranch}
+            disabled={isRunning}
+          >
+            <GitBranchIcon className="size-4" />
+          </TooltipIconButton>
         )}
         {onUndo && canUndo && (
           <TooltipIconButton
@@ -671,7 +764,7 @@ const ComposerAction: FC<{
             <ArrowUpIcon className="aui-composer-send-icon size-4.5" />
           </TooltipIconButton>
         )}
-        <AuiIf condition={(s) => !s.thread.isRunning}>
+        {!gatePending && !isRunning && (
           <ComposerPrimitive.Send asChild>
             <TooltipIconButton
               tooltip="Send message"
@@ -685,12 +778,27 @@ const ComposerAction: FC<{
               <ArrowUpIcon className="aui-composer-send-icon size-4.5" />
             </TooltipIconButton>
           </ComposerPrimitive.Send>
-        </AuiIf>
+        )}
+        {!gatePending && isRunning && (
+          <TooltipIconButton
+            tooltip="Steer Hermes (mid-turn correction)"
+            side="bottom"
+            type="button"
+            variant="default"
+            size="icon"
+            className="aui-composer-send size-7 rounded-full"
+            aria-label="Steer Hermes"
+            disabled={!composerText.trim()}
+            onClick={onSteer}
+          >
+            <ArrowUpIcon className="aui-composer-send-icon size-4.5" />
+          </TooltipIconButton>
+        )}
         <AuiIf condition={(s) => s.thread.isRunning && !gatePending}>
           <ComposerPrimitive.Cancel asChild>
             <Button
               type="button"
-              variant="default"
+              variant="outline"
               size="icon"
               className="aui-composer-cancel size-7 rounded-full"
               aria-label="Stop generating"
@@ -807,19 +915,27 @@ const AssistantBusyIndicator: FC = () => {
     ? "waiting"
     : meta.activity === "connecting" || meta.activity === "syncing"
       ? meta.activity
-      : isSearching
-        ? "searching"
-        : hasText
-          ? "streaming"
-          : "thinking";
-  const label = {
-    waiting: "Hermes is waiting for your input",
-    connecting: "Connecting to Hermes",
-    syncing: "Syncing the active response",
-    searching: "Hermes is searching",
-    streaming: "Hermes is responding",
-    thinking: "Hermes is thinking",
-  }[state];
+      : meta.activity === "compacting"
+        ? "loading"
+        : meta.activity === "tool" || meta.activity === "status"
+          ? "thinking"
+          : isSearching
+            ? "searching"
+            : hasText
+              ? "streaming"
+              : "thinking";
+  const label =
+    typeof meta.activityText === "string" && meta.activityText.trim()
+      ? meta.activityText
+      : {
+          waiting: "Hermes is waiting for your input",
+          connecting: "Connecting to Hermes",
+          syncing: "Syncing the active response",
+          loading: "Compacting context",
+          searching: "Hermes is searching",
+          streaming: "Hermes is responding",
+          thinking: "Hermes is thinking",
+        }[state];
 
   return <DotMatrix state={state} label={label} className="my-1 size-5 text-primary" />;
 };

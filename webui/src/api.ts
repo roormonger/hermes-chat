@@ -19,7 +19,17 @@ export const apiFetch = async (path: string, options: RequestInit = {}) => {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || res.statusText);
+    let message = text || res.statusText;
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed?.detail === "string") message = parsed.detail;
+      else if (Array.isArray(parsed?.detail)) {
+        message = parsed.detail.map((d: { msg?: string }) => d.msg || JSON.stringify(d)).join("; ");
+      }
+    } catch {
+      /* keep raw text */
+    }
+    throw new Error(message);
   }
   return res.json();
 };
@@ -30,9 +40,13 @@ type SseEventPayload =
   | { type: "process_exit" }
   | { type: "turn_complete" }
   | { type: "tool_start"; tool_id: string; name: string; context?: string }
+  | { type: "tool_generating"; tool_id?: string; name: string }
   | { type: "tool_progress"; tool_id: string; name: string; text: string }
   | { type: "tool_complete"; tool_id: string; name: string; summary?: string; duration_s?: number; result?: unknown; artifact?: unknown }
   | { type: "reasoning"; text: string; replace?: boolean }
+  | { type: "status_update"; kind?: string; text?: string }
+  | { type: "notification"; id?: string; key?: string; text: string; level?: string }
+  | { type: "notification_clear"; id?: string; key?: string }
   | { type: "session_title"; title: string; session_id?: string }
   | { type: "session_info"; model?: string; provider?: string; gateway?: string; api_provider?: string; reasoning_effort?: string; service_tier?: string; fast?: boolean; yolo?: boolean; context_window?: number; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; reasoning_tokens?: number; total_tokens?: number }
   | { type: "error"; message: string };
@@ -99,6 +113,150 @@ export const undoLastTurn = (chatId: string) =>
     method: "POST",
     body: JSON.stringify({ chat_id: chatId }),
   });
+
+export const compressChat = (chatId: string, focusTopic = "") =>
+  apiFetch("/v1/chat/compress", {
+    method: "POST",
+    body: JSON.stringify({ chat_id: chatId, focus_topic: focusTopic }),
+  });
+
+export const branchChat = (chatId: string, name = "") =>
+  apiFetch("/v1/chat/branch", {
+    method: "POST",
+    body: JSON.stringify({ chat_id: chatId, name }),
+  });
+
+export const steerChat = (chatId: string, text: string) =>
+  apiFetch("/v1/chat/steer", {
+    method: "POST",
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+
+export const attachImage = (chatId: string, contentBase64: string, filename = "") =>
+  apiFetch("/v1/image/attach", {
+    method: "POST",
+    body: JSON.stringify({
+      chat_id: chatId,
+      content_base64: contentBase64,
+      filename,
+    }),
+  });
+
+export const attachPdf = (chatId: string, contentBase64: string, filename = "uploaded.pdf") =>
+  apiFetch("/v1/pdf/attach", {
+    method: "POST",
+    body: JSON.stringify({
+      chat_id: chatId,
+      content_base64: contentBase64,
+      filename,
+    }),
+  }) as Promise<{
+    attached?: boolean;
+    pages_attached?: number;
+    text?: string;
+    ref_text?: string;
+    fallback?: string;
+    pdf_render_error?: string;
+  }>;
+
+export const attachFile = (chatId: string, dataUrl: string, filename = "", path = "") =>
+  apiFetch("/v1/file/attach", {
+    method: "POST",
+    body: JSON.stringify({
+      chat_id: chatId,
+      data_url: dataUrl,
+      filename,
+      path: path || filename,
+    }),
+  }) as Promise<{
+    attached?: boolean;
+    ref_text?: string;
+    ref_path?: string;
+    name?: string;
+    fallback?: string;
+  }>;
+
+export type HermesSessionListItem = {
+  id: string;
+  title: string;
+  preview: string;
+  started_at: number;
+  message_count: number;
+  source: string;
+  imported: boolean;
+  chat_id?: string | null;
+};
+
+export const listHermesSessions = (limit = 100) =>
+  apiFetch(`/v1/hermes-sessions?limit=${limit}`) as Promise<{ sessions: HermesSessionListItem[] }>;
+
+export const importHermesSession = (sessionId: string) =>
+  apiFetch("/v1/hermes-sessions/import", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  }) as Promise<{
+    chat_id: string;
+    title: string;
+    already_imported: boolean;
+    hermes_session_id: string;
+    message_count: number;
+    source?: string | null;
+  }>;
+
+export type SlashCommandEntry = {
+  command: string;
+  description: string;
+};
+
+export type CommandsCatalog = {
+  pairs?: [string, string][];
+  categories?: { name: string; pairs: [string, string][] }[];
+  canon?: Record<string, string>;
+  sub?: Record<string, string[]>;
+  skill_count?: number;
+  warning?: string;
+};
+
+export type SlashCommandResult = {
+  action: "output" | "send" | "skill" | "prefill";
+  text?: string;
+  message?: string;
+  name?: string;
+  notice?: string | null;
+};
+
+export const getCommandsCatalog = (chatId?: string | null) =>
+  apiFetch(
+    chatId
+      ? `/v1/chat/commands?chat_id=${encodeURIComponent(chatId)}`
+      : "/v1/chat/commands",
+  ) as Promise<CommandsCatalog>;
+
+export const runSlashCommand = (chatId: string, command: string) =>
+  apiFetch("/v1/chat/command", {
+    method: "POST",
+    body: JSON.stringify({ chat_id: chatId, command }),
+  }) as Promise<SlashCommandResult>;
+
+export function catalogToSlashEntries(catalog: CommandsCatalog): SlashCommandEntry[] {
+  const pairs = catalog.pairs?.length
+    ? catalog.pairs
+    : (catalog.categories ?? []).flatMap((c) => c.pairs ?? []);
+  const seen = new Set<string>();
+  const out: SlashCommandEntry[] = [];
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || pair.length < 1) continue;
+    const command = String(pair[0] || "").trim();
+    if (!command.startsWith("/") || seen.has(command.toLowerCase())) continue;
+    seen.add(command.toLowerCase());
+    out.push({
+      command,
+      description: String(pair[1] || "").trim() || "Slash command",
+    });
+  }
+  out.sort((a, b) => a.command.localeCompare(b.command));
+  return out;
+}
 
 export const getChatUsage = (chatId: string) =>
   apiFetch(`/api/chats/${chatId}/usage`);

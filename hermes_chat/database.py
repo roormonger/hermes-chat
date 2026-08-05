@@ -123,6 +123,25 @@ class ChatSessionStore:
             )
             conn.commit()
 
+    def find_chat_id_by_hermes_session_id(self, hermes_session_id: str) -> Optional[str]:
+        """Return the chat_id bound to this Hermes session, if any."""
+        if not hermes_session_id:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT chat_id FROM chat_sessions WHERE hermes_session_id = ?",
+                (hermes_session_id,),
+            ).fetchone()
+            return row[0] if row else None
+
+    def list_bound_hermes_session_ids(self) -> dict[str, str]:
+        """Return ``{hermes_session_id: chat_id}`` for every binding we know."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT hermes_session_id, chat_id FROM chat_sessions"
+            ).fetchall()
+            return {row[0]: row[1] for row in rows if row[0] and row[1]}
+
     def delete(self, chat_id: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM chat_sessions WHERE chat_id = ?", (chat_id,))

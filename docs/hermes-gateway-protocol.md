@@ -30,11 +30,19 @@ per chat, JSON-RPC requests via `_call()`, events drained onto an
 
 ## RPC methods currently used by Hermes Chat
 
-- `session.create` — first message in a chat; returns `session_id`.
+- `session.create` — first message in a chat; returns `session_id` (with `source: "hermes-chat"`).
+- `session.resume` — reopen a stored Hermes session after restart / on chat load.
+- `session.history` / `session.title` / `session.usage` / `session.context_breakdown`
 - `session.info` — cheap liveness probe (used to detect stale DB session ids after a Hermes Chat restart — see `ensure_session()`).
 - `prompt.submit` — send a user turn.
 - `image.attach_bytes` — attach base64 image before submitting a prompt.
-- `session.interrupt` — **now wired** (`GatewaySession.interrupt()`) to stop an in-flight turn from the stop button.
+- `pdf.attach` / `file.attach` — PDF vision tiles + `@file:` staging (`POST /v1/pdf/attach`, `POST /v1/file/attach`).
+- `session.interrupt` — stop an in-flight turn from the stop button.
+- `session.steer` — mid-turn correction without interrupting (`POST /v1/chat/steer`).
+- `session.undo` — pop last turn; returns composer `prefill` (`POST /v1/chat/undo`).
+- `session.compress` — manual context compact (`POST /v1/chat/compress`).
+- `session.branch` — fork into a new chat (`POST /v1/chat/branch`).
+- `commands.catalog` / `slash.exec` / `command.dispatch` — slash commands (`GET /v1/chat/commands`, `POST /v1/chat/command`).
 - `approval.respond` / `clarify.respond` / `sudo.respond` / `secret.respond` — resolve gate interrupts.
 
 ## Full method catalog (selected, from official docs + server.py grep)
@@ -77,28 +85,26 @@ Events we already translate in `gateway_session.py::_translate_event()`:
 
 - `message.delta` → `{"type": "text", "text": ...}`
 - `message.complete` / `turn.complete` → `{"type": "turn_complete"}`
-- `tool.start` / `tool.complete` → `tool_start` / `tool_complete`
+- `tool.start` / `tool.generating` / `tool.progress` / `tool.complete` → `tool_*`
+- `reasoning.delta` / `thinking.delta` / `reasoning.available` → `reasoning`
 - `approval.request` / `clarify.request` / `sudo.request` / `secret.request` → `gate_interrupt`
+- `status.update` → `status_update` (compacting / busy line in the UI)
+- `notification.show` / `notification.clear` → toast stack in the web UI
+- `session.title` / `session.info` → sidebar title + header usage/model
+- `error` → `error`
 
-Events emitted by the gateway that we **don't** yet surface (grepped every
-`_emit("...", ...)` call in `server.py`) — ranked by likely UI value:
+### Intentionally unsupported (desktop / niche)
 
-| Event | Payload | Potential UI use |
-|---|---|---|
-| `reasoning.delta` | `{text, verbose?}` | Extended-thinking / chain-of-thought stream, like Claude/ChatGPT "Thinking" panel. Also `thinking.delta`, `reasoning.available`. |
-| `tool.generating` | `{name}` | Show "calling {tool}..." before args are fully streamed (currently we only get `tool.start` once args are ready). |
-| `status.update` | `{kind, text}` | `kind` includes `"compacting"` — useful loading state during auto-compression. |
-| `session.info` | model, context window, token usage, cwd, git branch | Header info: current model, token/context usage bar. |
-| `notification.show` / `notification.clear` | `{text, level?, id, key}` | Toast notifications (credit warnings, background task completion). |
-| `moa.reference` / `moa.aggregating` | reference-model outputs | If Mixture-of-Agents mode is ever exposed, shows individual model outputs before aggregation. |
-| `review.summary` | `{text}` | Background code-review summaries. |
-| `terminal.read.request` (a **gate**, via `_block`) | `{start?, count?}` | Not yet in our gate-kind switch — would 500 if hit. Low priority (desktop-GUI-only feature: reading a PTY buffer). |
-| `agent.terminal.output` / close | subagent PTY passthrough | Only relevant if we ever add a "watch subagent" window. |
+| Event | Why skipped |
+|---|---|
+| `terminal.read.request` | Desktop PTY buffer gate — not a web chat concern |
+| `agent.terminal.output` / `agent.terminal.close` | Subagent PTY passthrough |
+| `moa.reference` / `moa.aggregating` | Mixture-of-Agents UI not exposed |
+| `review.summary` | Background code-review surface |
 
-Adding one of these is the same pattern every time: add a branch to
-`_translate_event()` in `hermes_chat/gateway_session.py` mapping the gateway event
-to a new SSE `type`, add that type to `SseEvent` in `webui/src/api.ts`, handle
-it in `handleStreamEvent` in `webui/src/App.tsx`.
+Unknown event types are logged at debug (`unhandled gateway event type=…`) and dropped so Hermes upgrades stay discoverable without breaking the stream.
+
+Adding a new bridged event: add a branch to `_translate_event()`, extend `SseEvent` in `webui/src/api.ts`, handle it in `handleStreamEvent` in `webui/src/App.tsx`.
 
 ## Gates we handle vs. don't
 
@@ -108,22 +114,14 @@ Handled (`respond_gate()` in `gateway_session.py`): `approval`, `clarify`,
 Not handled: `terminal.read.request` (desktop-GUI PTY read gate — skip,
 not relevant to a web chat client).
 
-## Attachment methods beyond images
+## Attachment methods
 
-We currently only use `image.attach_bytes`. Two more exist and would be easy
-wins for feature parity with the TUI:
-
-- **`pdf.attach`** — takes a PDF, server-side renders each page to PNG and
-  queues them as vision tiles, same downstream path as image attach. Would
-  let users drag in PDFs the same way they drag in images today.
-- **`file.attach`** — stages an arbitrary non-image file into the session
-  workspace. Params: `session_id`, and either `path` (gateway-visible path)
-  or `data_url` (base64 upload — **this is our path**, since the browser
-  can't give the gateway a local filesystem path). Returns `ref_path` +
-  `ref_text` (`@file:<path>`) that should be **inserted into the prompt
-  text**, not attached silently — the agent's file tools resolve `@file:`
-  refs. This is how the TUI does "attach a text file / code file / log" for
-  non-image content, as opposed to base64-embedding.
+- **`image.attach_bytes`** — `POST /v1/image/attach` — base64 image → vision tile queue.
+- **`pdf.attach`** — `POST /v1/pdf/attach` — PDF → `pdftoppm` page PNGs queued as vision tiles.
+  If `pdftoppm` is missing, hermes-chat falls back to `file.attach` and returns `ref_text`.
+- **`file.attach`** — `POST /v1/file/attach` — `data_url` upload staged under
+  `.hermes/desktop-attachments/`; returns `ref_text` (`@file:…`) that the UI
+  **inserts into the prompt** before `prompt.submit`.
 
 ## TUI session import — the key finding
 
@@ -177,55 +175,41 @@ table.
 useful for cold import than `session.resume`, which works even if the
 session was never opened in this gateway process.
 
-### Prerequisite fix: tag our own sessions with a distinct `source`
+### Session `source` tagging
 
-**Confirmed by reading `session.create`'s handler**: `source =
-str(params.get("source") or "tui").strip() or "tui"` — when no `source` param
-is given, the gateway defaults to `"tui"`. Our `GatewaySession.ensure_session()`
-calls `self._call("session.create", {})` with **no `source` param at all**,
-so every chat created through `hermes-layer` is *currently indistinguishable
-from a real TUI session* in `session.list` / the `sessions` table.
+**Done:** `GatewaySession.ensure_session()` creates sessions with
+`{"source": "hermes-chat"}` (`HERMES_CHAT_SOURCE` in `gateway_session.py`).
+Without that, the gateway defaults to `"tui"` and our chats are
+indistinguishable from the real TUI in `session.list` / `state.db`.
 
-**Fix before shipping the import picker**: pass `{"source": "hermes-chat"}`
-(or similar) in that `session.create` call. This is a one-line change in
-`hermes_chat/gateway_session.py::ensure_session()`. Without it, every chat created
-via the web UI would show up in its own "import from TUI" picker, and worse,
-re-importing one would resume a session that's already backing an existing
-hermes-chat conversation.
+Import pickers should filter to `source == "tui"` (and other native surfaces)
+and exclude `"hermes-chat"` so we never re-import a session that already
+backs a hermes-chat conversation.
+
+### Hermes as session SoT (done)
+
+- **`session.resume` first** — `ensure_session`, `prompt.submit` (4001 retry),
+  and `image.attach_bytes` resume from Hermes `state.db` before inventing a
+  new empty session after a gateway/process restart.
+- **Open chat** — `GET /api/chats/{id}/messages` resumes the mapped Hermes
+  session, updates the stored tip id if compression forked it, syncs title
+  when our cache still says `"New chat"`, and seeds the local message cache
+  from Hermes when that cache is empty.
+- **Rename** — `PATCH /api/chats/{id}` also calls `session.title` when bound.
+- **Usage** — already via `session.usage` / `session.context_breakdown`.
+- Local SQLite stays a **cache** (stable numeric message ids for edit/reload);
+  Hermes remains authoritative for the agent turn.
 
 ### Recommended import flow
 
-1. New endpoint e.g. `GET /v1/tui-sessions` → Hermes Chat calls `session.list`
-   on a throwaway/shared `GatewaySession`, filters to `source == "tui"`
-   (excluding `"hermes-chat"` and the internal `"tool"` deny-list already
-   applied by the gateway), returns
-   `{id, title, preview, started_at, message_count}[]` for a picker UI.
-2. `POST /v1/tui-sessions/{id}/import` → Hermes Chat calls `session.resume` with
-   that `session_id`, gets back `messages`. Create a new chat in
-   `chat_history.py` (`create_chat`), bulk-insert the returned messages via
-   `add_message()` (mapping `role` directly, `tool` role messages can be
-   rendered as a collapsed tool-step pill or skipped for MVP), and — critically
-   — store the **resolved** `session_id` from the resume response (it may
-   differ from the requested one if compression forked it) as this chat's
-   `hermes_session_id` via `store.set_hermes_session_id(...)` so subsequent
-   `prompt.submit` calls continue the *same* Hermes session instead of
-   creating a new empty one.
-3. UI: a "Import from TUI" entry in the sidebar (or new-chat menu) opens a
-   picker fed by step 1, calls step 2 on selection, then `loadMessages()` +
-   switch to the new chat.
+**Done** in hermes-chat:
 
-Caveats to verify before shipping:
-- Multiple concurrent imports of the *same* TUI session would each call
-  `session.resume`, which makes it live under one gateway session — need to
-  decide whether re-importing an already-imported session should re-resume
-  (continue) vs. clone-as-read-only-then-fork. Simplest MVP: only allow
-  importing a given TUI session once; track imported `session_id`s in our DB
-  and grey them out in the picker.
-- `session.resume`'s `messages` list drops empty/whitespace-only turns and
-  collapses tool calls — good for display, but if we want faithful re-export
-  later we'd want `session.history` too (it has the same normalization, so no
-  extra fidelity there — the *raw* schema lives only in `state.db`'s
-  `messages` table, see below).
+1. `GET /v1/hermes-sessions` → `session.list`, excludes `source == "hermes-chat"`,
+   marks already-bound ids as `imported` + `chat_id`.
+2. `POST /v1/hermes-sessions/import` → `session.resume`, creates a chat, seeds
+   local cache, binds tip `hermes_session_id`. Re-import of an already-bound
+   session opens the existing chat.
+3. Sidebar **Import session** picker.
 
 ## Model picker — feasible and well-supported
 
@@ -360,12 +344,20 @@ free" that we don't — automatic visibility of sessions from *any* Hermes
 surface without an explicit import step — is exactly what our `session.list`
 + `session.resume` import flow above would replicate deliberately instead.
 
+## Slash / power commands
+
+Wired in hermes-chat:
+
+- **`commands.catalog`** → `GET /v1/chat/commands` — autocomplete pairs / categories / canon.
+- **`slash.exec`** then **`command.dispatch`** → `POST /v1/chat/command` — same fallthrough as the TUI.
+- Normalized actions: `output` (inline), `send` / `skill` (prompt.submit), `prefill` (composer draft).
+- Long-handler RPC wait: `QueueTransport` intercepts JSON-RPC responses for pool methods (`slash.exec`, `session.resume`, …) so `_call` always returns a real result.
+
+Local-only: `/new`, `/clear` start a new chat in the web UI.
+
 ## Open items / not yet investigated
 
-- `session.branch` (fork a session) and `session.compress` (manual compact) —
-  not investigated in depth; likely future "fork this conversation" /
-  "compact to save tokens" UI affordances, same low-risk RPC-wrapper pattern
-  as `interrupt()`.
-- `session.steer` — inject a message into the *next* tool result without
-  interrupting the current turn. Interesting for a "nudge while it's working"
-  input, distinct from cancel-and-resubmit.
+- Session tools: ~~`session.branch` / `session.compress` / richer undo~~ done
+  (`POST /v1/chat/compress`, `POST /v1/chat/branch`; undo returns `prefill`).
+- TUI session import: ~~`session.list` + `session.resume` picker~~ done
+  (`GET /v1/hermes-sessions`, `POST /v1/hermes-sessions/import`).

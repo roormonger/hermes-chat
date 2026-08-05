@@ -5,7 +5,6 @@ import {
   useExternalStoreRuntime,
   CompositeAttachmentAdapter,
   SimpleImageAttachmentAdapter,
-  SimpleTextAttachmentAdapter,
   type AppendMessage,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
@@ -24,9 +23,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { Plus, Trash2, Pencil, Pin, MessageSquare, Check, X, LogOut, PanelLeftClose, PanelLeftOpen, Menu, Sun, Moon, ChevronUp } from "lucide-react";
+import { Plus, Trash2, Pencil, Pin, MessageSquare, Check, X, LogOut, PanelLeftClose, PanelLeftOpen, Menu, Sun, Moon, ChevronUp, Download } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { apiFetch, getModels, getAnalyticsModels, getCurrentModel, getUsage, getActiveChatRun, getChatUsage, saveChatUsage, saveMessageUsage, setModel, startChatRun, streamChatRun, streamEvents, undoLastTurn, speakText, type SseEvent } from "./api";
+import { HermesFileAttachmentAdapter, isPdfAttachment } from "./lib/hermes-file-attachment-adapter";
+import { apiFetch, getModels, getAnalyticsModels, getCurrentModel, getUsage, getActiveChatRun, getChatUsage, saveChatUsage, saveMessageUsage, setModel, startChatRun, streamChatRun, streamEvents, undoLastTurn, compressChat, branchChat, steerChat, speakText, getCommandsCatalog, catalogToSlashEntries, runSlashCommand, attachImage, attachPdf, attachFile, listHermesSessions, importHermesSession, type SseEvent, type SlashCommandEntry, type HermesSessionListItem } from "./api";
 import { useAuth, AuthProvider, AuthGuard } from "./auth";
 import { useAutoSpeak } from "./hooks/useAutoSpeak";
 import { useVoiceCapabilities } from "./hooks/useVoiceCapabilities";
@@ -70,7 +70,8 @@ type ChatMessage = {
   images?: string[];  // data URLs for user-attached images
   status?: "running" | "complete" | "error" | "cancelled";
   error?: string;
-  activity?: "connecting" | "syncing";
+  activity?: "connecting" | "syncing" | "compacting" | "status" | "tool";
+  activityText?: string;
   gate?: Gate | null;
   toolSteps?: ToolStep[];
   reasoning?: string;
@@ -217,6 +218,7 @@ const toThreadMessage = (msg: ChatMessage): ThreadMessageLike => ({
     custom: {
       ...(msg.gate ? { gate: msg.gate } : {}),
       ...(msg.activity ? { activity: msg.activity } : {}),
+      ...(msg.activityText ? { activityText: msg.activityText } : {}),
       ...((msg.toolSteps ?? []).some((step) => step.status === "running")
         ? { runningTools: (msg.toolSteps ?? []).filter((step) => step.status === "running").map((step) => step.name) }
         : {}),
@@ -260,20 +262,10 @@ const STARTER_SUGGESTIONS: StarterSuggestion[] = [
 
 const getAppendText = (msg: AppendMessage): string => {
   const parts = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content;
-  const textParts = (parts as any[])
+  return (parts as any[])
     .filter((p) => p.type === "text")
     .map((p) => p.text)
     .join("");
-  // Text/document file attachments are inlined; images are uploaded separately
-  const documentParts: string[] = [];
-  for (const att of (msg.attachments ?? []) as any[]) {
-    for (const part of (att.content ?? []) as any[]) {
-      if (part.type === "text") {
-        documentParts.push(`[File: ${att.name ?? "attachment"}]\n${part.text ?? ""}`);
-      }
-    }
-  }
-  return [textParts, ...documentParts].filter(Boolean).join("\n\n");
 };
 
 const getAppendImages = (msg: AppendMessage): Array<{ data: string; name: string }> => {
@@ -283,6 +275,28 @@ const getAppendImages = (msg: AppendMessage): Array<{ data: string; name: string
     for (const part of (att.content ?? []) as any[]) {
       if (part.type === "image" && part.image) {
         results.push({ data: part.image as string, name });
+      }
+    }
+  }
+  return results;
+};
+
+/** Non-image composer attachments (PDF / file) carrying data URLs for Hermes upload. */
+const getAppendFiles = (
+  msg: AppendMessage,
+): Array<{ dataUrl: string; name: string; mimeType: string; kind: "pdf" | "file" }> => {
+  const results: Array<{ dataUrl: string; name: string; mimeType: string; kind: "pdf" | "file" }> = [];
+  for (const att of (msg.attachments ?? []) as any[]) {
+    const name: string = att.name ?? "attachment";
+    const mimeType: string = att.contentType ?? "";
+    for (const part of (att.content ?? []) as any[]) {
+      if (part.type === "file" && part.data) {
+        results.push({
+          dataUrl: String(part.data),
+          name: part.filename || name,
+          mimeType: part.mimeType || mimeType,
+          kind: isPdfAttachment(part.filename || name, part.mimeType || mimeType) ? "pdf" : "file",
+        });
       }
     }
   }
@@ -653,11 +667,180 @@ function formatChatDate(value: string | number | undefined): string {
   });
 }
 
+function formatHermesSessionWhen(startedAt: number): string {
+  if (!startedAt) return "";
+  // Hermes may return seconds or milliseconds.
+  const ms = startedAt > 1e12 ? startedAt : startedAt * 1000;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function sourceLabel(source: string): string {
+  const map: Record<string, string> = {
+    tui: "TUI",
+    api_server: "API",
+    cli: "CLI",
+    desktop: "Desktop",
+    acp: "ACP",
+  };
+  return map[source] || source || "Hermes";
+}
+
+function ImportHermesSessionsDialog({
+  open,
+  onOpenChange,
+  onImported,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onImported: (chatId: string) => void;
+}) {
+  const [sessions, setSessions] = useState<HermesSessionListItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [importingId, setImportingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setQuery("");
+    (async () => {
+      try {
+        const data = await listHermesSessions(150);
+        if (!cancelled) setSessions(data.sessions ?? []);
+      } catch (e) {
+        if (!cancelled) setError((e as Error).message || "Failed to list Hermes sessions");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.preview.toLowerCase().includes(q) ||
+        s.source.toLowerCase().includes(q) ||
+        s.id.toLowerCase().includes(q),
+    );
+  }, [sessions, query]);
+
+  const handleImport = async (session: HermesSessionListItem) => {
+    if (session.imported && session.chat_id) {
+      onImported(session.chat_id);
+      onOpenChange(false);
+      return;
+    }
+    setImportingId(session.id);
+    setError(null);
+    try {
+      const result = await importHermesSession(session.id);
+      onImported(result.chat_id);
+      onOpenChange(false);
+    } catch (e) {
+      setError((e as Error).message || "Import failed");
+    } finally {
+      setImportingId(null);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col gap-3">
+        <DialogHeader>
+          <DialogTitle>Import Hermes session</DialogTitle>
+        </DialogHeader>
+        <p className="text-sm text-muted-foreground">
+          Resume a TUI, CLI, or desktop conversation into Hermes Chat.
+        </p>
+        <Input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search sessions…"
+          className="h-8 text-sm"
+        />
+        {error && (
+          <p className="text-sm text-destructive break-words">{error}</p>
+        )}
+        <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1 space-y-1 max-h-[50vh]">
+          {loading && (
+            <p className="text-sm text-muted-foreground px-2 py-4">Loading sessions…</p>
+          )}
+          {!loading && filtered.length === 0 && (
+            <p className="text-sm text-muted-foreground px-2 py-4">
+              {query.trim() ? "No matching sessions." : "No importable Hermes sessions found."}
+            </p>
+          )}
+          {filtered.map((session) => (
+            <button
+              key={session.id}
+              type="button"
+              disabled={importingId !== null}
+              onClick={() => void handleImport(session)}
+              className={cn(
+                "w-full text-left rounded-lg border px-3 py-2.5 transition-colors",
+                "hover:bg-accent/50 disabled:opacity-60",
+                session.imported && "opacity-75",
+              )}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium text-sm truncate">{session.title}</div>
+                  {session.preview && (
+                    <div className="text-xs text-muted-foreground line-clamp-2 mt-0.5">
+                      {session.preview}
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 mt-1 text-[11px] text-muted-foreground">
+                    <span>{sourceLabel(session.source)}</span>
+                    <span>·</span>
+                    <span>{session.message_count} msgs</span>
+                    {formatHermesSessionWhen(session.started_at) && (
+                      <>
+                        <span>·</span>
+                        <span>{formatHermesSessionWhen(session.started_at)}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <span className="shrink-0 text-xs font-medium text-primary pt-0.5">
+                  {importingId === session.id
+                    ? "…"
+                    : session.imported
+                      ? "Open"
+                      : "Import"}
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ChatSidebar({
   chats,
   currentChatId,
   onSelect,
   onNew,
+  onImportSession,
   onRename,
   onDelete,
   onPin,
@@ -677,6 +860,7 @@ function ChatSidebar({
   currentChatId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onImportSession: (chatId: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
   onPin: (id: string, pinned: boolean) => void;
@@ -697,6 +881,7 @@ function ChatSidebar({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [profileOpen, setProfileOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const filteredChats = search.trim()
     ? chats.filter((c) => c.title.toLowerCase().includes(search.toLowerCase()))
     : chats;
@@ -781,6 +966,15 @@ function ChatSidebar({
         >
           <Plus className="size-4" />
           {!collapsed && "New Chat"}
+        </Button>
+        <Button
+          variant="ghost"
+          className={cn("h-9", collapsed ? "w-10 px-0 justify-center" : "w-full justify-start gap-2")}
+          onClick={() => setImportOpen(true)}
+          title="Import Hermes session"
+        >
+          <Download className="size-4" />
+          {!collapsed && "Import session"}
         </Button>
         {!collapsed && (
           <Input
@@ -1026,6 +1220,14 @@ function ChatSidebar({
         </div>
       </div>
       </div>
+      <ImportHermesSessionsDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={(chatId) => {
+          onImportSession(chatId);
+          onMobileClose();
+        }}
+      />
     </>
   );
 }
@@ -1051,6 +1253,9 @@ function ChatApp() {
   const [pendingGate, setPendingGate] = useState<Gate | null>(null);
   const [recoveryCandidate, setRecoveryCandidate] = useState<{ chatId: string; message: ChatMessage } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<
+    { id: string; key?: string; text: string; level: string }[]
+  >([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [currentModelDisplay, setCurrentModelDisplay] = useState<string>("");
   const [profileModels, setProfileModels] = useState<Set<string>>(new Set());
@@ -1071,6 +1276,8 @@ function ChatApp() {
     totalTokens?: number;
   }>({});
   const [starterSuggestions, setStarterSuggestions] = useState<StarterSuggestion[]>([...STARTER_SUGGESTIONS]);
+  const [slashCommands, setSlashCommands] = useState<SlashCommandEntry[]>([]);
+  const [composerDraft, setComposerDraft] = useState<string | null>(null);
 
   const assistantIdRef = useRef<string | null>(null);
   const assistantContentRef = useRef("");
@@ -1139,6 +1346,39 @@ function ChatApp() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const catalog = await getCommandsCatalog(currentChatId);
+        if (cancelled) return;
+        const entries = catalogToSlashEntries(catalog);
+        // Always surface /new locally even if Hermes catalog omits it.
+        if (!entries.some((e) => e.command === "/new")) {
+          entries.unshift({ command: "/new", description: "Start a new chat" });
+        }
+        if (!entries.some((e) => e.command === "/clear")) {
+          entries.unshift({ command: "/clear", description: "Clear and start a new conversation" });
+        }
+        setSlashCommands(entries);
+      } catch {
+        if (!cancelled) {
+          setSlashCommands([
+            { command: "/new", description: "Start a new chat" },
+            { command: "/clear", description: "Clear and start a new conversation" },
+            { command: "/help", description: "Show available slash commands" },
+            { command: "/model", description: "Switch model (e.g. /model gpt-4o)" },
+            { command: "/usage", description: "Show token usage for this session" },
+            { command: "/compress", description: "Compress context (optionally: /compress <topic>)" },
+          ]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentChatId]);
 
   const loadChats = useCallback(async () => {
     try {
@@ -1281,6 +1521,17 @@ function ChatApp() {
       setError((e as Error).message);
     }
   };
+
+  const handleImportedSession = useCallback(async (chatId: string) => {
+    try {
+      await loadChats();
+      selectChat(chatId);
+      setMobileSidebarOpen(false);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [loadChats, selectChat]);
+
   const createChatRef = useRef(createChat);
   createChatRef.current = createChat;
 
@@ -1340,8 +1591,56 @@ function ChatApp() {
     const chatId = currentChatIdRef.current;
     if (!chatId || isRunning) return;
     try {
-      await undoLastTurn(chatId);
+      const result = await undoLastTurn(chatId);
       await loadMessages(chatId);
+      const draft = (result?.prefill || "").trim();
+      if (draft) setComposerDraft(draft);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const handleCompress = async () => {
+    const chatId = currentChatIdRef.current;
+    if (!chatId || isRunning) return;
+    try {
+      const result = await compressChat(chatId);
+      await loadMessages(chatId);
+      void refreshUsage(chatId);
+      const before = result?.before_tokens ?? result?.before_messages;
+      const after = result?.after_tokens ?? result?.after_messages;
+      const summary = (result?.summary || "").toString().trim();
+      const toastId = `compress-${Date.now()}`;
+      const text =
+        before != null && after != null
+          ? `Compressed ${before} → ${after}${summary ? `: ${summary.slice(0, 120)}` : ""}`
+          : summary || "Context compressed";
+      setToasts((prev) => [...prev, { id: toastId, text, level: "info" }]);
+      setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== toastId));
+      }, 5000);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const handleBranch = async () => {
+    const chatId = currentChatIdRef.current;
+    if (!chatId || isRunning) return;
+    try {
+      const result = await branchChat(chatId);
+      await loadChats();
+      if (result?.chat_id) {
+        selectChat(result.chat_id);
+        const toastId = `branch-${Date.now()}`;
+        setToasts((prev) => [
+          ...prev,
+          { id: toastId, text: `Branched → ${result.title || "new chat"}`, level: "info" },
+        ]);
+        setTimeout(() => {
+          setToasts((prev) => prev.filter((t) => t.id !== toastId));
+        }, 4000);
+      }
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1386,9 +1685,11 @@ function ChatApp() {
       }
       setMessages((prev) => {
         const activeMessage = prev.find((message) => message.id === assistantId);
-        if (!activeMessage?.activity) return prev;
+        if (!activeMessage?.activity && !activeMessage?.activityText) return prev;
         return prev.map((message) =>
-          message.id === assistantId ? { ...message, activity: undefined } : message
+          message.id === assistantId
+            ? { ...message, activity: undefined, activityText: undefined }
+            : message
         );
       });
       if (event.type === "text") {
@@ -1419,6 +1720,19 @@ function ChatApp() {
             m.id === assistantId ? { ...m, reasoning } : m
           )
         );
+      } else if (event.type === "tool_generating") {
+        const name = event.name || "tool";
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  activity: "tool",
+                  activityText: `Calling ${name}…`,
+                }
+              : m
+          )
+        );
       } else if (event.type === "tool_start") {
         const sourceId = event.tool_id || event.name;
         const toolId = `${assistantId}-tool-${assistantToolStepsRef.current.length}-${sourceId}`;
@@ -1429,10 +1743,28 @@ function ChatApp() {
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
-              ? { ...m, toolSteps: assistantToolStepsRef.current }
+              ? { ...m, toolSteps: assistantToolStepsRef.current, activity: undefined, activityText: undefined }
               : m
           )
         );
+      } else if (event.type === "tool_progress") {
+        const steps = [...(assistantToolStepsRef.current ?? [])];
+        const sourceId = event.tool_id || event.name;
+        const idxBySource = steps.findLastIndex(
+          (step) => step.status === "running" && step.sourceId === sourceId,
+        );
+        const idx = idxBySource !== -1
+          ? idxBySource
+          : steps.findLastIndex((step) => step.status === "running" && step.name === event.name);
+        if (idx !== -1 && event.text) {
+          steps[idx] = { ...steps[idx], context: event.text };
+          assistantToolStepsRef.current = steps;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, toolSteps: steps } : m
+            )
+          );
+        }
       } else if (event.type === "tool_complete") {
         // eslint-disable-next-line no-console
         console.log("[tool_complete]", event.name, "result", event.result, "artifact", event.artifact);
@@ -1493,6 +1825,61 @@ function ChatApp() {
             audio.play().catch(() => {});
           }).catch(() => {});
         }
+      } else if (event.type === "status_update") {
+        const kind = (event.kind || "").toLowerCase();
+        const text = (event.text || "").trim();
+        if (!kind && !text) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? { ...m, activity: undefined, activityText: undefined }
+                : m
+            )
+          );
+        } else {
+          const activity =
+            kind === "compacting" || kind.includes("compact")
+              ? ("compacting" as const)
+              : ("status" as const);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    activity,
+                    activityText: text || (activity === "compacting" ? "Compacting context…" : kind),
+                  }
+                : m
+            )
+          );
+        }
+      } else if (event.type === "notification") {
+        if (event.text?.trim()) {
+          const id = event.id || event.key || `n-${Date.now()}`;
+          setToasts((prev) => {
+            const without = prev.filter((t) => t.id !== id && (!event.key || t.key !== event.key));
+            return [
+              ...without,
+              {
+                id,
+                key: event.key,
+                text: event.text.trim(),
+                level: event.level || "info",
+              },
+            ];
+          });
+          window.setTimeout(() => {
+            setToasts((prev) => prev.filter((t) => t.id !== id));
+          }, 8000);
+        }
+      } else if (event.type === "notification_clear") {
+        setToasts((prev) =>
+          prev.filter((t) => {
+            if (event.id && t.id === event.id) return false;
+            if (event.key && t.key === event.key) return false;
+            return true;
+          })
+        );
       } else if (event.type === "session_title") {
         if (event.title) {
           setChats((prev) =>
@@ -1808,7 +2195,7 @@ function ChatApp() {
   const attachmentAdapter = useMemo(
     () => new CompositeAttachmentAdapter([
       new SimpleImageAttachmentAdapter(),
-      new SimpleTextAttachmentAdapter(),
+      new HermesFileAttachmentAdapter(),
     ]),
     []
   );
@@ -1856,9 +2243,151 @@ function ChatApp() {
         await handleGateChoice(text);
         return;
       }
-      if (isRunning) return;
+      if (isRunning) {
+        const chatId = currentChatIdRef.current;
+        const trimmed = text.trim();
+        if (!chatId || !trimmed) return;
+        try {
+          const result = await steerChat(chatId, trimmed);
+          const status = (result as any)?.status || "queued";
+          if (status === "rejected") {
+            setError("Hermes rejected the mid-turn steer. Try again after the next tool step.");
+            return;
+          }
+          const preview = trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
+          const toastId = `steer-${Date.now()}`;
+          setToasts((prev) => [
+            ...prev,
+            { id: toastId, text: `Steered: ${preview}`, level: "info" },
+          ]);
+          window.setTimeout(() => {
+            setToasts((prev) => prev.filter((t) => t.id !== toastId));
+          }, 6000);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantIdRef.current
+                ? { ...m, activity: "status", activityText: "Steering Hermes…" }
+                : m
+            )
+          );
+        } catch (e) {
+          setError((e as Error).message || "Failed to steer");
+        }
+        return;
+      }
       const images = getAppendImages(message);
-      if (!text.trim() && images.length === 0) return;
+      const files = getAppendFiles(message);
+      if (!text.trim() && images.length === 0 && files.length === 0) return;
+
+      const trimmed = text.trim();
+      // Slash commands: local UI actions or Hermes slash.exec / command.dispatch.
+      if (trimmed.startsWith("/") && images.length === 0 && files.length === 0) {
+        const cmdName = trimmed.slice(1).split(/\s+/)[0]?.toLowerCase() || "";
+        if (cmdName === "new" || cmdName === "clear") {
+          await createChatRef.current();
+          return;
+        }
+
+        let chatId = currentChatIdRef.current;
+        if (!chatId) {
+          const data = await apiFetch("/api/chats", {
+            method: "POST",
+            body: JSON.stringify({ title: "New chat" }),
+          });
+          setChats((prev) => [data, ...prev]);
+          selectChat(data.chat_id);
+          chatId = data.chat_id;
+        }
+
+        await createBackendMessage(chatId, "user", trimmed);
+        const now = Date.now();
+        setMessages((prev) => [
+          ...prev,
+          { id: generateId(), role: "user", content: trimmed, createdAt: now },
+        ]);
+
+        try {
+          const result = await runSlashCommand(chatId, trimmed);
+          const notice = (result.notice || "").trim();
+          if (notice) {
+            const noticeId = await createBackendMessage(chatId, "assistant", notice);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: noticeId,
+                role: "assistant",
+                content: notice,
+                status: "complete",
+                createdAt: Date.now(),
+              },
+            ]);
+          }
+
+          if (result.action === "output") {
+            const out = (result.text || "(no output)").trim() || "(no output)";
+            const outId = await createBackendMessage(chatId, "assistant", out);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: outId,
+                role: "assistant",
+                content: out,
+                status: "complete",
+                createdAt: Date.now(),
+              },
+            ]);
+            return;
+          }
+
+          if (result.action === "prefill") {
+            const draft = (result.message || "").trim();
+            if (draft) setComposerDraft(draft);
+            return;
+          }
+
+          if (result.action === "skill" || result.action === "send") {
+            const prompt = (result.message || "").trim();
+            if (!prompt) {
+              setError(`/${cmdName}: empty message`);
+              return;
+            }
+            if (result.action === "skill" && result.name) {
+              const tip = `⚡ loading skill: ${result.name}`;
+              const tipId = await createBackendMessage(chatId, "assistant", tip);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: tipId,
+                  role: "assistant",
+                  content: tip,
+                  status: "complete",
+                  createdAt: Date.now(),
+                },
+              ]);
+            }
+            await streamAssistant(chatId, prompt);
+            return;
+          }
+
+          setError(`/${cmdName}: unrecognized command response`);
+        } catch (e) {
+          const errText = (e as Error).message || "Slash command failed";
+          setError(errText);
+          const errId = await createBackendMessage(chatId, "assistant", `error: ${errText}`);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: errId,
+              role: "assistant",
+              content: `error: ${errText}`,
+              status: "error",
+              error: errText,
+              createdAt: Date.now(),
+            },
+          ]);
+        }
+        return;
+      }
 
       let chatId = currentChatIdRef.current;
       if (!chatId) {
@@ -1871,37 +2400,57 @@ function ChatApp() {
         chatId = data.chat_id;
       }
 
-      // Upload images to the gateway before prompt.submit so they arrive
-      // as native multimodal content parts rather than text workarounds.
+      // Upload attachments to Hermes before prompt.submit.
+      // Images/PDFs → vision tiles; other files → @file: refs inserted into the prompt.
       for (const img of images) {
         try {
-          await apiFetch("/v1/image/attach", {
-            method: "POST",
-            body: JSON.stringify({
-              chat_id: chatId,
-              content_base64: img.data,
-              filename: img.name,
-            }),
-          });
+          await attachImage(chatId, img.data, img.name);
         } catch (e) {
           setError(`Failed to attach image: ${(e as Error).message}`);
           return;
         }
       }
 
-      await createBackendMessage(chatId, "user", text, images.map((img) => img.data));
+      const fileRefs: string[] = [];
+      for (const file of files) {
+        try {
+          if (file.kind === "pdf") {
+            const pdfResult = await attachPdf(chatId, file.dataUrl, file.name);
+            // When pdftoppm is missing the backend falls back to file.attach.
+            if (pdfResult?.ref_text) {
+              fileRefs.push(String(pdfResult.ref_text));
+            }
+          } else {
+            const result = await attachFile(chatId, file.dataUrl, file.name);
+            if (result?.ref_text) {
+              fileRefs.push(String(result.ref_text));
+            } else {
+              setError(`Failed to attach ${file.name}: no @file: ref returned`);
+              return;
+            }
+          }
+        } catch (e) {
+          setError(`Failed to attach ${file.name}: ${(e as Error).message}`);
+          return;
+        }
+      }
+
+      const promptText = [fileRefs.join(" "), text].filter((s) => s.trim()).join("\n\n");
+      if (!promptText.trim() && images.length === 0) return;
+
+      await createBackendMessage(chatId, "user", promptText || text, images.map((img) => img.data));
       const now = Date.now();
       setMessages((prev) => [
         ...prev,
         {
           id: generateId(),
           role: "user",
-          content: text,
+          content: promptText || text,
           images: images.map((img) => img.data),
           createdAt: now,
         },
       ]);
-      await streamAssistant(chatId, text);
+      await streamAssistant(chatId, promptText || text);
     },
     onEdit: async (message: AppendMessage) => {
       const chatId = currentChatIdRef.current;
@@ -2010,6 +2559,7 @@ function ChatApp() {
         currentChatId={currentChatId}
         onSelect={(id) => { selectChat(id); setMobileSidebarOpen(false); }}
         onNew={() => { void createChat(); }}
+        onImportSession={(chatId) => { void handleImportedSession(chatId); }}
         onRename={renameChat}
         onDelete={deleteChat}
         onPin={pinChat}
@@ -2101,14 +2651,33 @@ function ChatApp() {
           </div>
         </div>
 
-        {error && (
-          <div className="absolute top-2 right-2 z-50 rounded-md bg-destructive px-4 py-2 text-sm text-destructive-foreground shadow">
-            {error}
+        {(error || toasts.length > 0) && (
+          <div className="absolute top-2 right-2 z-50 flex max-w-sm flex-col gap-2">
+            {error && (
+              <div className="rounded-md bg-destructive px-4 py-2 text-sm text-destructive-foreground shadow">
+                {error}
+              </div>
+            )}
+            {toasts.map((toast) => (
+              <div
+                key={toast.id}
+                className={cn(
+                  "rounded-md border px-4 py-2 text-sm shadow",
+                  toast.level === "error" || toast.level === "danger"
+                    ? "border-destructive/40 bg-destructive text-destructive-foreground"
+                    : toast.level === "warning" || toast.level === "warn"
+                      ? "border-amber-500/40 bg-amber-500/15 text-foreground"
+                      : "border-border bg-card text-foreground",
+                )}
+              >
+                {toast.text}
+              </div>
+            ))}
           </div>
         )}
         <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
           <AssistantRuntimeProvider aui={aui} runtime={runtime}>
-            <Thread onUndo={handleUndo} contextWindow={contextWindow} threadUsage={threadUsage as any} autoSpeak={autoSpeak} onAutoSpeakToggle={toggleAutoSpeak} voiceCaps={voiceCaps} ttsVoice={ttsVoice} gatePending={Boolean(pendingGate)} onGateChoice={handleGateChoice} starterSuggestions={starterSuggestions} />
+            <Thread onUndo={handleUndo} onCompress={handleCompress} onBranch={handleBranch} contextWindow={contextWindow} threadUsage={threadUsage as any} autoSpeak={autoSpeak} onAutoSpeakToggle={toggleAutoSpeak} voiceCaps={voiceCaps} ttsVoice={ttsVoice} gatePending={Boolean(pendingGate)} onGateChoice={handleGateChoice} starterSuggestions={starterSuggestions} slashCommands={slashCommands} composerDraft={composerDraft} onComposerDraftConsumed={() => setComposerDraft(null)} />
           </AssistantRuntimeProvider>
         </div>
         <ModelPicker

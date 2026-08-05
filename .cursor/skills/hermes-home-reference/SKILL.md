@@ -46,10 +46,14 @@ hermes-chat uses **TUI gateway** — same surface as the Ink TUI — via **in-pr
 ### Chat-critical RPC
 
 - `session.create` — pass `source` (prefer `"hermes-chat"` so sessions aren’t anonymous `"tui"`)
-- `session.info` / `session.list` / `session.resume` / `session.history`
+- `session.resume` — reopen stored sessions after restart / on chat load (prefer over inventing a new id)
+- `session.info` / `session.list` / `session.history` / `session.title` / `session.usage`
+  (web import: `GET /v1/hermes-sessions`, `POST /v1/hermes-sessions/import`)
 - `prompt.submit` — `{session_id, text}`
-- `session.interrupt`, optional `session.undo` / `steer` / `compress` / `branch`
+- `session.interrupt`, `session.steer` (mid-turn correction), optional `session.undo` / `session.redirect` / `compress` / `branch`
+- Slash: `commands.catalog`, `slash.exec`, `command.dispatch` (web: `GET /v1/chat/commands`, `POST /v1/chat/command`)
 - Attachments: `image.attach` / `image.attach_bytes` / `pdf.attach` / `file.attach`
+  (web: `POST /v1/image/attach`, `/v1/pdf/attach`, `/v1/file/attach` — file refs go into the prompt)
 - Gates: `approval.respond`, `clarify.respond`, `sudo.respond`, `secret.respond`
 - Skip for web: `terminal.read.respond` (desktop PTY)
 
