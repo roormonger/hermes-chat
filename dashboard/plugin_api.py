@@ -509,7 +509,7 @@ async def post_restore_suggestions_prompt(body: SuggestionsPromptRestore) -> dic
 @router.get("/suggestions/status")
 async def get_suggestions_status() -> dict:
     try:
-        from hermes_chat.suggestions import SuggestionStore
+        from hermes_chat.suggestions import SuggestionStore, retry_delay_for
 
         cfg = load_config()
         store = SuggestionStore()
@@ -518,15 +518,26 @@ async def get_suggestions_status() -> dict:
         for user in users:
             meta = store.get_meta(user["user_id"])
             pool = store.get_pool(user["user_id"])
-            pools.append(
-                {
-                    "user_id": user["user_id"],
-                    "username": user.get("username"),
-                    "count": len(pool),
-                    "mode": (meta or {}).get("mode"),
-                    "updated_at": (meta or {}).get("updated_at"),
-                }
-            )
+            failure = store.get_failure(user["user_id"])
+            entry = {
+                "user_id": user["user_id"],
+                "username": user.get("username"),
+                "count": len(pool),
+                "mode": (meta or {}).get("mode"),
+                "updated_at": (meta or {}).get("updated_at"),
+            }
+            if failure:
+                failures = int(failure["failures"])
+                entry.update(
+                    {
+                        "failures": failures,
+                        "last_error": failure.get("error"),
+                        "last_attempt_at": failure.get("last_attempt_at"),
+                        "next_attempt_at": float(failure["last_attempt_at"])
+                        + retry_delay_for(failures),
+                    }
+                )
+            pools.append(entry)
         return {
             "enabled": cfg.suggestions_enabled,
             "interval_minutes": cfg.suggestions_interval_minutes,

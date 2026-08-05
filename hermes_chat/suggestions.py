@@ -119,6 +119,23 @@ def restore_suggestions_prompt_from_bundle() -> str:
     return content
 
 
+_RETRY_BASE_S = 300.0
+_RETRY_MAX_S = 6 * 3600.0
+
+
+def retry_delay_for(failures: int) -> float:
+    """Back off after failed refreshes.
+
+    A refresh spends a real model request, so a persistent failure (exhausted
+    daily quota, missing provider key, model that won't emit JSON) must not be
+    retried on the worker's normal tick — that burns the user's rate limit on
+    attempts that cannot succeed.
+    """
+    if failures <= 0:
+        return 0.0
+    return min(_RETRY_MAX_S, _RETRY_BASE_S * (2 ** (failures - 1)))
+
+
 class SuggestionStore:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self._db_path = db_path or (data_dir() / "suggestions.db")
@@ -143,6 +160,16 @@ class SuggestionStore:
                 pool_json TEXT NOT NULL,
                 updated_at REAL NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'generic'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS suggestion_failures (
+                user_id TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL,
+                last_attempt_at REAL NOT NULL,
+                error TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -181,6 +208,38 @@ class SuggestionStore:
             (user_id, json.dumps(pool), time.time(), mode),
         )
         self._conn().commit()
+
+    def get_failure(self, user_id: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT failures, last_attempt_at, error FROM suggestion_failures WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_failure(self, user_id: str, error: str) -> int:
+        """Count a failed attempt and return the new consecutive-failure count."""
+        conn = self._conn()
+        conn.execute(
+            """
+            INSERT INTO suggestion_failures (user_id, failures, last_attempt_at, error)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                failures = suggestion_failures.failures + 1,
+                last_attempt_at = excluded.last_attempt_at,
+                error = excluded.error
+            """,
+            (user_id, time.time(), error[:500]),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT failures FROM suggestion_failures WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return int(row["failures"]) if row else 1
+
+    def clear_failure(self, user_id: str) -> None:
+        conn = self._conn()
+        conn.execute("DELETE FROM suggestion_failures WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 
 def normalize_suggestion(item: Any) -> Optional[dict[str, str]]:
@@ -357,6 +416,7 @@ def generate_pool_for_user(
     gw.submit(prompt)
 
     chunks: list[str] = []
+    last_note = ""
     deadline = time.monotonic() + 120.0
     while time.monotonic() < deadline:
         remaining = max(0.1, deadline - time.monotonic())
@@ -385,12 +445,24 @@ def generate_pool_for_user(
             raise RuntimeError("suggestion generation started a tool; aborted")
         elif etype == "turn_complete":
             break
-        elif etype == "error":
-            raise RuntimeError(event.get("message") or "suggestion generation error")
+        elif etype in ("error", "process_exit"):
+            raise RuntimeError(
+                event.get("message") or last_note or "suggestion generation error"
+            )
+        elif etype == "notification":
+            # Provider failures (rate limits, bad keys) arrive here, not as text.
+            note = (event.get("text") or "").strip()
+            if note:
+                last_note = note
 
     text = "".join(chunks)
     parsed = parse_suggestions_json(text)
     if not parsed:
+        if not text.strip():
+            raise RuntimeError(
+                "model returned no text — "
+                + (last_note or "provider error or rate limit?")
+            )
         raise RuntimeError(f"could not parse suggestions JSON (got {len(text)} chars)")
     return parsed[:pool_size], mode
 
@@ -442,6 +514,11 @@ class SuggestionWorker:
                 and self.store.get_pool(user["user_id"])
             ):
                 continue
+            failure = self.store.get_failure(user["user_id"])
+            if not force and failure:
+                delay = retry_delay_for(int(failure["failures"]))
+                if time.time() - float(failure["last_attempt_at"]) < delay:
+                    continue
             try:
                 pool, mode = generate_pool_for_user(
                     user=user,
@@ -450,6 +527,7 @@ class SuggestionWorker:
                     loop=self._loop,
                 )
                 self.store.set_pool(user["user_id"], pool, mode)
+                self.store.clear_failure(user["user_id"])
                 logger.info(
                     "refreshed suggestion pool for %s (%s items, mode=%s)",
                     user.get("username"),
@@ -465,9 +543,13 @@ class SuggestionWorker:
                     }
                 )
             except Exception as exc:
+                count = self.store.record_failure(user["user_id"], str(exc))
+                retry_in = retry_delay_for(count)
                 logger.warning(
-                    "suggestion refresh failed for %s: %s",
+                    "suggestion refresh failed for %s (%d in a row, next try in ~%d min): %s",
                     user.get("username"),
+                    count,
+                    int(retry_in // 60),
                     exc,
                 )
                 failed.append(
@@ -475,6 +557,8 @@ class SuggestionWorker:
                         "user_id": user["user_id"],
                         "username": user.get("username"),
                         "error": str(exc),
+                        "failures": count,
+                        "retry_in_s": retry_in,
                     }
                 )
         return {"refreshed": refreshed, "failed": failed}
