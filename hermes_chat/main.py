@@ -14,7 +14,6 @@ See README.md for the full protocol description.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import os
@@ -1600,32 +1599,28 @@ async def save_message_usage(chat_id: str, message_id: int, request: UsageSaveRe
 
 class SpeakRequest(BaseModel):
     text: str
-    lang: str | None = None
-    voice: str | None = None
+
+
+_AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+}
 
 
 @app.get("/api/plugins/hermes-chat/voice-config")
 async def get_voice_config(current_user: dict = Depends(get_current_user)) -> dict:
-    cfg = load_config()
-    from . import voice as voice_mod
+    from .voice import voice_status
 
-    hermes_tts = voice_mod.hermes_tts_available()
-    hermes_stt = voice_mod.hermes_stt_available()
-    plugin_tts = voice_mod.plugin_tts_available()
-    plugin_stt = voice_mod.plugin_stt_available()
-    return {
-        "voice_enabled": cfg.voice_enabled,
-        "default_tts_voice": cfg.default_tts_voice,
-        "tts_available": hermes_tts or plugin_tts,
-        "stt_available": hermes_stt or plugin_stt,
-        "tts_backend": "hermes" if hermes_tts else ("plugin" if plugin_tts else "none"),
-        "stt_backend": "hermes" if hermes_stt else ("plugin" if plugin_stt else "none"),
-    }
+    cfg = load_config()
+    return {"voice_enabled": cfg.voice_enabled, **voice_status()}
 
 
 @app.post("/v1/audio/transcribe")
 async def transcribe_audio(file: UploadFile, current_user: dict = Depends(get_current_user)) -> dict:
-    """Transcribe uploaded audio (webm/opus from browser) via Hermes STT (plugin fallback)."""
+    """Transcribe uploaded audio (webm/opus from browser) via Hermes STT."""
     if not load_config().voice_enabled:
         raise HTTPException(status_code=503, detail="Voice is disabled in settings.")
     import shutil
@@ -1636,18 +1631,16 @@ async def transcribe_audio(file: UploadFile, current_user: dict = Depends(get_cu
         shutil.copyfileobj(file.file, tmp)
         tmp_path = Path(tmp.name)
     try:
-        from .voice import transcribe
+        from .voice import VoiceUnavailable, transcribe
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, transcribe, tmp_path)
-        return {
-            "text": result["text"],
-            "provider": result.get("provider"),
-            "source": result.get("source"),
-        }
-    except ImportError as e:
-        logger.error("Voice dependencies not installed: %s", e)
-        raise HTTPException(status_code=503, detail="Voice support not installed. Install dependencies via the dashboard → Install Voice button.")
+        try:
+            result = await loop.run_in_executor(None, transcribe, tmp_path)
+        except VoiceUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"text": result["text"], "provider": result.get("provider")}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Transcription failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
@@ -1657,35 +1650,28 @@ async def transcribe_audio(file: UploadFile, current_user: dict = Depends(get_cu
 
 @app.post("/v1/audio/speak")
 async def speak_text(request: SpeakRequest, current_user: dict = Depends(get_current_user)) -> FileResponse:
-    """Synthesize speech via Hermes TTS providers (plugin Edge fallback). Returns audio file."""
+    """Synthesize speech via Hermes TTS providers (`tts.` in ~/.hermes/config.yaml)."""
     if not load_config().voice_enabled:
         raise HTTPException(status_code=503, detail="Voice is disabled in settings.")
-    if request.voice is None:
-        request.voice = load_config().default_tts_voice
     try:
-        from .voice import synthesize
+        from starlette.background import BackgroundTask
 
-        result = await synthesize(request.text, lang=request.lang, voice=request.voice)
+        from .voice import VoiceUnavailable, discard_audio, synthesize
+
+        try:
+            result = await synthesize(request.text)
+        except VoiceUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         audio_path = Path(result["path"])
-        media_type = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav"
-        if audio_path.suffix.lower() == ".ogg":
-            media_type = "audio/ogg"
-        elif audio_path.suffix.lower() == ".flac":
-            media_type = "audio/flac"
-        filename = f"speech{audio_path.suffix or '.mp3'}"
-        logger.info(
-            "TTS source=%s provider=%s path=%s",
-            result.get("source"), result.get("provider"), audio_path.name,
-        )
+        suffix = audio_path.suffix.lower()
         return FileResponse(
             str(audio_path),
-            media_type=media_type,
-            filename=filename,
-            background=None,
+            media_type=_AUDIO_MEDIA_TYPES.get(suffix, "audio/mpeg"),
+            filename=f"speech{suffix or '.mp3'}",
+            background=BackgroundTask(discard_audio, audio_path),
         )
-    except ImportError as e:
-        logger.error("Voice dependency import failed: %s", e)
-        raise HTTPException(status_code=503, detail=f"Voice dependency not available: {e}. Try reinstalling via the dashboard → Install Voice button.")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("TTS failed: %s", e)
         raise HTTPException(status_code=500, detail=f"TTS failed: {e}")

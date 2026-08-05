@@ -276,6 +276,18 @@ export const saveMessageUsage = (chatId: string, messageId: string, usage: any) 
 export const getVoiceDeps = () => apiFetch("/api/plugins/hermes-chat/deps");
 export const getVoiceConfig = () => apiFetch("/api/plugins/hermes-chat/voice-config");
 
+/** Surface FastAPI's `detail` instead of a raw JSON body for audio failures. */
+const audioError = async (res: Response): Promise<Error> => {
+  const text = await res.text();
+  try {
+    const detail = JSON.parse(text)?.detail;
+    if (typeof detail === "string") return new Error(detail);
+  } catch {
+    /* keep raw text */
+  }
+  return new Error(text || res.statusText);
+};
+
 export const transcribeAudio = async (blob: Blob): Promise<string> => {
   const token = getToken();
   const formData = new FormData();
@@ -287,7 +299,7 @@ export const transcribeAudio = async (blob: Blob): Promise<string> => {
     },
     body: formData,
   });
-  if (!res.ok) throw new Error(await res.text() || res.statusText);
+  if (!res.ok) throw await audioError(res);
   const data = await res.json();
   return data.text as string;
 };
@@ -310,7 +322,8 @@ function stripMarkdown(md: string): string {
     .trim();
 }
 
-export const speakText = async (text: string, lang?: string, voice?: string): Promise<string> => {
+/** Voice and provider come from Hermes' own `tts.` config, not the browser. */
+export const speakText = async (text: string): Promise<string> => {
   const token = getToken();
   const clean = stripMarkdown(text);
   const res = await fetch("/v1/audio/speak", {
@@ -319,9 +332,9 @@ export const speakText = async (text: string, lang?: string, voice?: string): Pr
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ text: clean, lang, voice }),
+    body: JSON.stringify({ text: clean }),
   });
-  if (!res.ok) throw new Error(await res.text() || res.statusText);
+  if (!res.ok) throw await audioError(res);
   const blob = await res.blob();
   return URL.createObjectURL(blob);
 };

@@ -137,8 +137,7 @@
     const [missingDeps, setMissingDeps] = useState([]);
     const [missingOptionalDeps, setMissingOptionalDeps] = useState([]);
     const [voiceEnabled, setVoiceEnabled] = useState(true);
-    const [defaultTtsVoice, setDefaultTtsVoice] = useState("en-US-AriaNeural");
-    const [voiceDepsAvailable, setVoiceDepsAvailable] = useState({ tts: true, stt: true });
+    const [voiceStatus, setVoiceStatus] = useState({ tts: true, stt: true, ttsProvider: "", sttProvider: "", detail: "" });
     const [settingsHost, setSettingsHost] = useState("");
     const [settingsPort, setSettingsPort] = useState("");
     const [suggestionsEnabled, setSuggestionsEnabled] = useState(true);
@@ -187,8 +186,13 @@
       try {
         const data = await fetchJSON("/voice-config");
         setVoiceEnabled(data.voice_enabled);
-        setDefaultTtsVoice(data.default_tts_voice);
-        setVoiceDepsAvailable({ tts: data.tts_available, stt: data.stt_available });
+        setVoiceStatus({
+          tts: !!data.tts_available,
+          stt: !!data.stt_available,
+          ttsProvider: data.tts_provider || "",
+          sttProvider: data.stt_provider || "",
+          detail: data.detail || "",
+        });
       } catch (_) {}
     }, []);
 
@@ -321,17 +325,6 @@
     };
     const onRefreshLogs = () => act(loadLogs(), null);
 
-    const TTS_VOICES = [
-      { label: "Aria (US Female)", value: "en-US-AriaNeural" },
-      { label: "Jenny (US Female)", value: "en-US-JennyNeural" },
-      { label: "Guy (US Male)", value: "en-US-GuyNeural" },
-      { label: "Eric (US Male)", value: "en-US-EricNeural" },
-      { label: "Sonia (UK Female)", value: "en-GB-SoniaNeural" },
-      { label: "Ryan (UK Male)", value: "en-GB-RyanNeural" },
-      { label: "Natasha (AU Female)", value: "en-AU-NatashaNeural" },
-      { label: "William (AU Male)", value: "en-AU-WilliamNeural" },
-    ];
-
     const onSaveVoiceSettings = async () => {
       setLoading(true);
       setError(null);
@@ -339,7 +332,7 @@
       try {
         await fetchJSON("/config", {
           method: "POST",
-          body: JSON.stringify({ voice_enabled: voiceEnabled, default_tts_voice: defaultTtsVoice }),
+          body: JSON.stringify({ voice_enabled: voiceEnabled }),
         });
         setNotice("Voice settings saved.");
         await loadVoiceConfig();
@@ -585,11 +578,11 @@
         ),
         missingOptionalDeps.length > 0 && missingDeps.length === 0 && h("div", { className: "rounded-md border border-blue-400 bg-blue-50 dark:bg-blue-950 dark:border-blue-700 p-3 text-sm flex items-start justify-between gap-3" },
           h("div", null,
-            h("span", { className: "font-semibold text-blue-800 dark:text-blue-200" }, "Voice support not installed: "),
+            h("span", { className: "font-semibold text-blue-800 dark:text-blue-200" }, "Optional dependencies missing: "),
             h("span", { className: "text-blue-700 dark:text-blue-300" }, missingOptionalDeps.map(d => d.requirement).join(", ")),
-            h("p", { className: "text-blue-600 dark:text-blue-400 text-xs mt-1" }, missingOptionalDeps.map(d => d.feature).join(", ") + ". Install to enable voice input and output.")
+            h("p", { className: "text-blue-600 dark:text-blue-400 text-xs mt-1" }, missingOptionalDeps.map(d => d.feature).join(", "))
           ),
-          h(Button, { onClick: onInstallDeps, disabled: loading, size: "sm", variant: "outline" }, loading ? "Installing..." : "Install Voice")
+          h(Button, { onClick: onInstallDeps, disabled: loading, size: "sm", variant: "outline" }, loading ? "Installing..." : "Install")
         ),
         notice && h("div", { className: "rounded-md border border-green-400 bg-green-50 dark:bg-green-950 dark:border-green-700 p-3 text-sm flex items-center justify-between gap-3" },
           h("span", { className: "text-green-800 dark:text-green-200" }, "✓ " + notice),
@@ -726,35 +719,32 @@
           h(Card, null,
             h(CardHeader, null,
               h(CardTitle, null, "Voice Settings"),
-              h("p", { className: "text-sm text-muted-foreground" }, "Enable or disable voice features and set the default TTS voice for all users.")
+              h("p", { className: "text-sm text-muted-foreground" }, "Chat voice uses Hermes' own speech providers. Choose the voice and engine in ~/.hermes/config.yaml under tts. and stt.")
             ),
             h(CardContent, { className: "space-y-4" },
-              !voiceDepsAvailable.tts && !voiceDepsAvailable.stt && h("div", { className: "rounded-md border border-yellow-400 bg-yellow-50 dark:bg-yellow-950 dark:border-yellow-700 p-3 text-sm text-yellow-800 dark:text-yellow-200" },
-                "⚠ Voice dependencies are not installed. Install them above to enable voice features."
+              !voiceStatus.tts && !voiceStatus.stt && h("div", { className: "rounded-md border border-yellow-400 bg-yellow-50 dark:bg-yellow-950 dark:border-yellow-700 p-3 text-sm text-yellow-800 dark:text-yellow-200" },
+                "⚠ " + (voiceStatus.detail || "Hermes voice tools are unavailable. Install the Hermes voice extras (hermes-agent[voice]).")
               ),
               h("label", { className: "flex items-center justify-between rounded-md border px-4 py-3 cursor-pointer" },
                 h("div", null,
                   h("div", { className: "text-sm font-medium" }, "Enable Voice"),
-                  h("div", { className: "text-xs text-muted-foreground" }, voiceDepsAvailable.tts || voiceDepsAvailable.stt ? "Allow users to use voice input and output." : "Requires voice dependencies to be installed.")
+                  h("div", { className: "text-xs text-muted-foreground" }, voiceStatus.tts || voiceStatus.stt ? "Allow users to use voice input and output." : "Requires Hermes voice tools to be available.")
                 ),
                 h("input", {
                   type: "checkbox",
                   checked: voiceEnabled,
-                  disabled: !voiceDepsAvailable.tts && !voiceDepsAvailable.stt,
+                  disabled: !voiceStatus.tts && !voiceStatus.stt,
                   onChange: (e) => setVoiceEnabled(e.target.checked),
                   className: "h-4 w-4 cursor-pointer"
                 })
               ),
-              h("div", { className: "flex flex-col gap-2" },
-                h("label", { className: "text-sm font-medium" }, "Default TTS Voice"),
-                h("p", { className: "text-xs text-muted-foreground" }, "Used as the fallback voice when users haven't chosen one."),
-                h("select", {
-                  value: defaultTtsVoice,
-                  onChange: (e) => setDefaultTtsVoice(e.target.value),
-                  disabled: !voiceDepsAvailable.tts,
-                  className: "rounded-md border border-input bg-background px-3 py-2 text-sm max-w-xs" + (!voiceDepsAvailable.tts ? " opacity-40 cursor-not-allowed" : "")
-                },
-                  TTS_VOICES.map(v => h("option", { key: v.value, value: v.value }, v.label))
+              h("div", { className: "rounded-md border px-4 py-3 space-y-1" },
+                h("div", { className: "text-sm font-medium" }, "Hermes speech backends"),
+                h("div", { className: "text-xs text-muted-foreground" },
+                  "Speech to text: " + (voiceStatus.stt ? "Hermes" + (voiceStatus.sttProvider ? " (" + voiceStatus.sttProvider + ")" : "") : "unavailable")
+                ),
+                h("div", { className: "text-xs text-muted-foreground" },
+                  "Text to speech: " + (voiceStatus.tts ? "Hermes" + (voiceStatus.ttsProvider ? " (" + voiceStatus.ttsProvider + ")" : "") : "unavailable")
                 )
               ),
               h(Button, { onClick: onSaveVoiceSettings, disabled: loading, size: "sm" }, "Save Voice Settings")

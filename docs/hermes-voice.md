@@ -134,30 +134,38 @@ Extras: `hermes-agent[voice]` (faster-whisper, sounddevice); `[tts-premium]`
 
 ---
 
-## hermes-chat today vs target
+## hermes-chat today
 
-| | After spike | Remaining |
-|--|-------------|-----------|
-| STT | Hermes `transcribe_audio` first; plugin Whisper fallback | Drop plugin fallback |
-| TTS | Hermes `text_to_speech_tool` first; plugin Edge fallback | Drop plugin fallback |
-| Wire | `/v1/audio/*` unchanged for UI | Optional `data_url` parity with Desktop |
-| Session | Mic → STT → normal chat submit; Read aloud / auto-speak → TTS | Unchanged |
+The plugin has **no speech stack of its own** — Edge TTS and faster-whisper are gone,
+along with the dashboard voice picker and its "Install Voice" button.
 
----
+| | Implementation |
+|--|----------------|
+| STT | `tools.transcription_tools.transcribe_audio` only; 503 + install hint when unavailable |
+| TTS | `tools.tts_tool.text_to_speech_tool` only; voice/provider come from `tts.` config |
+| Wire | `POST /v1/audio/transcribe` → `{text, provider}`; `POST /v1/audio/speak` → audio FileResponse |
+| Config | `voice-config` returns `tts_available` / `stt_available`, `*_backend`, `*_provider`, `detail` |
+| Session | Mic → STT → normal chat submit; reply → TTS. Nothing bypasses the gateway turn |
 
-## Recommended spike (next TODO item)
+`/v1/audio/speak` takes only `{text}`: per-user voice selection was removed because
+the voice belongs to Hermes' `tts.` config, the same as the CLI.
 
-~~Smallest proof that **Hermes-configured** audio rides the same chat session~~ **Done.**
+### Hands-free voice mode
 
-`hermes_chat/voice.py` now:
+The web UI mirrors Hermes' own voice mode instead of stopping at push-to-talk:
 
-1. Calls `text_to_speech_tool` / `transcribe_audio` when importable (same process as `tui_gateway`).
-2. Falls back to plugin Edge TTS / faster-whisper if Hermes tools missing or fail.
-3. Keeps `/v1/audio/speak` (FileResponse) and `/v1/audio/transcribe` (`{text}`) so the UI is unchanged; responses also include `provider` / `source` on STT; voice-config exposes `tts_backend` / `stt_backend`.
+1. `useVoiceRecorder({ autoStopOnSilence: true })` watches mic RMS through an
+   `AnalyserNode` and ends the capture ~1.5s after speech stops (with no-speech
+   and max-duration cutoffs).
+2. The transcript is appended to the thread automatically — no Send press.
+3. On `turn_complete` the reply is spoken via Hermes TTS.
+4. When playback ends the mic re-arms, so a conversation continues untouched.
 
-**Next:** remove or hard-gate the plugin fallback once Hermes path is trusted in production installs.
+The loop is state-driven in `App.tsx` (`voiceMode` / `voicePhase`): it listens only
+while the thread is idle, so Hermes' own speech is never recorded back. Decision
+gates deliberately pause the loop — approvals stay manual.
 
-**Out of spike:** `voice.record` from the browser, host auto-TTS, Discord VC,
+**Still out of scope:** `voice.record` from the browser, host auto-TTS, Discord VC,
 wake words, gateway streaming TTS.
 
 ---
@@ -167,4 +175,5 @@ wake words, gateway streaming TTS.
 - Add `voice.*` + Desktop `/api/audio/*` notes to `docs/hermes-gateway-protocol.md`.
 - Re-grep `tui_gateway/server.py` after Hermes upgrades (TODO “v2026.8.3+” may
   differ from this 0.18.2 tree).
-- Do not expand plugin Edge/Whisper features until the spike lands.
+- Voice now requires `hermes-agent[voice]` (or a cloud `stt.`/`tts.` provider) in the
+  environment that runs the plugin; there is no in-plugin fallback to install.

@@ -6,7 +6,7 @@ Stay a **thin chat UI on top of Hermes `tui_gateway`**, not a parallel agent run
 
 - Prefer Hermes RPC / events / session identity over custom backends.
 - Translate gateway events faithfully; avoid inventing parallel chat logic.
-- New Hermes features (voice, redirects, slash commands, …) should land by **wiring the gateway**, not by bolting on one-off workarounds (e.g. our Edge TTS / Whisper stack).
+- New Hermes features (voice, redirects, slash commands, …) should land by **wiring the gateway**, not by bolting on one-off workarounds (the Edge TTS / Whisper stack that used to live here is gone).
 
 Official surface: [programmatic integration](https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration) · local map: `docs/hermes-gateway-protocol.md` · wrapper: `hermes_chat/gateway_session.py`
 
@@ -39,18 +39,17 @@ Ordered by “feels like CLI/desktop” impact:
 
 ---
 
-## 🟡 Voice — replace the workaround with Hermes
+## 🟡 Voice — now Hermes-only
 
-Today: `/v1/audio/*` prefers Hermes `tools.tts_tool` / `transcription_tools` (Desktop parity); falls back to plugin Edge + Whisper. Native gateway `voice.*` remains host-audio only.
+Today: `/v1/audio/*` calls Hermes `tools.tts_tool` / `transcription_tools` exclusively (Desktop parity). No plugin speech stack. Native gateway `voice.*` remains host-audio only, so it stays unused.
 
 Research: [`docs/hermes-voice.md`](docs/hermes-voice.md)
 
 - [x] **Research: how native voice attaches to `tui_gateway` / sessions** — Gateway `voice.toggle` / `voice.record` / `voice.tts` + events are **host mic/speakers**. Browser-shaped path is Desktop `POST /api/audio/transcribe|speak` → Hermes tools.
-- [x] **Spike: one turn of Hermes TTS (or STT) through our chat path** — `hermes_chat/voice.py` calls Hermes providers first; `/v1/audio/speak` + `/transcribe` keep the same UI contract; `voice-config` reports `tts_backend` / `stt_backend` (`hermes`|`plugin`|`none`).
-- [ ] **Replace plugin TTS/STT** — Drop or hard-gate Edge/Whisper fallback once Hermes path is reliable in prod; align dashboard “Install Voice” with Hermes `[voice]` extras.
-- [ ] **Stretch: conversational voice in the web UI** — Streaming clause TTS + barge-in only as **browser-local** playback control; don’t expect gateway streaming or barge RPCs.
-
-Until replace lands, keep the plugin fallback; don’t expand it.
+- [x] **Spike: one turn of Hermes TTS (or STT) through our chat path** — `hermes_chat/voice.py` calls Hermes providers; `/v1/audio/speak` + `/transcribe` keep the same UI contract.
+- [x] **Replace plugin TTS/STT** — Edge/Whisper/langdetect removed from `voice.py`, `requirements.txt`, and optional deps. Missing tools now return 503 with the `hermes-agent[voice]` hint. Dashboard reports Hermes `stt`/`tts` providers instead of pip packages; per-user Edge voice picker and “Install Voice” are gone (voice lives in `~/.hermes/config.yaml`).
+- [x] **Conversational voice in the web UI** — Hands-free mode: browser VAD auto-stops on silence, auto-submits the transcript, speaks the reply through Hermes TTS, then re-arms the mic. Listens only while the thread is idle; gates stay manual.
+- [ ] **Stretch: streaming clause TTS + barge-in** — Speak partial replies and let the user interrupt playback. Browser-local only; don’t expect gateway streaming or barge RPCs.
 
 ---
 

@@ -84,7 +84,6 @@ class ConfigUpdate(BaseModel):
     auto_start: Optional[bool] = None
     hermes_dashboard_url: Optional[str] = None
     voice_enabled: Optional[bool] = None
-    default_tts_voice: Optional[str] = None
     suggestions_enabled: Optional[bool] = None
     suggestions_interval_minutes: Optional[int] = None
     suggestions_pool_size: Optional[int] = None
@@ -144,18 +143,12 @@ async def get_config() -> dict:
 
 @router.get("/voice-config")
 async def get_voice_config() -> dict:
+    """Voice availability, sourced from Hermes' own STT/TTS providers."""
     try:
+        from hermes_chat.voice import voice_status
+
         cfg = load_config()
-        missing_optional = check_optional_dependencies()
-        missing_str = " ".join(
-            d if isinstance(d, str) else d.get("requirement", "") for d in missing_optional
-        )
-        return {
-            "voice_enabled": cfg.voice_enabled,
-            "default_tts_voice": cfg.default_tts_voice,
-            "tts_available": "edge-tts" not in missing_str,
-            "stt_available": "faster-whisper" not in missing_str and "imageio-ffmpeg" not in missing_str,
-        }
+        return {"voice_enabled": cfg.voice_enabled, **voice_status()}
     except Exception as exc:
         _handle_exc(exc)
 

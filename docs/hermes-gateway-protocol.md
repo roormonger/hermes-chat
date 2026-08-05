@@ -365,9 +365,12 @@ Gateway RPCs exist but are **host-audio** (not for remote browsers):
 Browser-correct path (Desktop): Hermes `hermes_cli/web_server.py`
 `POST /api/audio/transcribe` + `POST /api/audio/speak` →
 `tools.transcription_tools` / `tools.tts_tool` → bytes/`data_url`.
-hermes-chat `/v1/audio/*` prefers Hermes `tools.tts_tool` /
-`tools.transcription_tools` (same as Desktop); plugin Edge/Whisper is fallback.
-`GET .../voice-config` reports `tts_backend` / `stt_backend`.
+hermes-chat `/v1/audio/*` calls Hermes `tools.tts_tool` /
+`tools.transcription_tools` (same as Desktop) and nothing else — there is no
+plugin speech fallback. `GET .../voice-config` reports `tts_available` /
+`stt_available`, `*_backend`, the configured `*_provider`, and a `detail` hint
+when the tools are missing. `POST /v1/audio/speak` takes `{text}` only; the voice
+comes from the user's `tts.` config.
 
 ## Open items / not yet investigated
 
@@ -375,5 +378,5 @@ hermes-chat `/v1/audio/*` prefers Hermes `tools.tts_tool` /
   (`POST /v1/chat/compress`, `POST /v1/chat/branch`; undo returns `prefill`).
 - TUI session import: ~~`session.list` + `session.resume` picker~~ done
   (`GET /v1/hermes-sessions`, `POST /v1/hermes-sessions/import`).
-- Voice research: ~~done~~ → spike Hermes TTS/STT on `/v1/audio/*`
-  (`docs/hermes-voice.md`) ~~done~~ (Hermes-first + plugin fallback).
+- Voice: ~~research~~ ~~spike~~ ~~replace plugin stack~~ all done — Hermes-only
+  STT/TTS plus browser hands-free voice mode (`docs/hermes-voice.md`).

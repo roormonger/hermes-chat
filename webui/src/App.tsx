@@ -9,7 +9,7 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { Thread } from "@/components/assistant-ui/thread";
-import type { StarterSuggestion } from "@/components/assistant-ui/thread";
+import type { StarterSuggestion, VoicePhase } from "@/components/assistant-ui/thread";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -29,10 +29,9 @@ import { HermesFileAttachmentAdapter, isPdfAttachment } from "./lib/hermes-file-
 import { apiFetch, getModels, getAnalyticsModels, getCurrentModel, getUsage, getActiveChatRun, getChatUsage, saveChatUsage, saveMessageUsage, setModel, startChatRun, streamChatRun, streamEvents, undoLastTurn, compressChat, branchChat, steerChat, speakText, getCommandsCatalog, catalogToSlashEntries, runSlashCommand, attachImage, attachPdf, attachFile, listHermesSessions, importHermesSession, type SseEvent, type SlashCommandEntry, type HermesSessionListItem } from "./api";
 import { useAuth, AuthProvider, AuthGuard } from "./auth";
 import { useAutoSpeak } from "./hooks/useAutoSpeak";
-import { useVoiceCapabilities } from "./hooks/useVoiceCapabilities";
+import { useVoiceCapabilities, type VoiceCapabilities } from "./hooks/useVoiceCapabilities";
 import { useTheme } from "./hooks/useTheme";
-import { useTTSVoice } from "./hooks/useTTSVoice";
-import { TTS_VOICES } from "./hooks/useTTSVoice";
+import { useVoiceRecorder } from "./hooks/useVoiceRecorder";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -848,8 +847,6 @@ function ChatSidebar({
   onLogout,
   theme,
   onToggleTheme,
-  ttsVoice,
-  onTtsVoiceChange,
   voiceCaps,
   collapsed,
   onToggleCollapse,
@@ -868,9 +865,7 @@ function ChatSidebar({
   onLogout: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
-  ttsVoice: string;
-  onTtsVoiceChange: (v: string) => void;
-  voiceCaps: { ttsAvailable: boolean; sttAvailable: boolean };
+  voiceCaps: VoiceCapabilities;
   collapsed: boolean;
   onToggleCollapse: () => void;
   mobileOpen: boolean;
@@ -1169,24 +1164,16 @@ function ChatSidebar({
                 {theme === "dark" ? "Switch to Light" : "Switch to Dark"}
               </button>
             </div>
-            {voiceCaps.ttsAvailable && (
+            {(voiceCaps.ttsAvailable || voiceCaps.sttAvailable) && (
             <div className="p-3 border-b">
               <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Voice</p>
-              <div className="flex flex-col gap-1">
-                {TTS_VOICES.map((v) => (
-                  <button
-                    key={v.value}
-                    onClick={() => onTtsVoiceChange(v.value)}
-                    className={cn(
-                      "flex items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors text-left",
-                      ttsVoice === v.value ? "bg-primary/10 text-primary" : "hover:bg-muted"
-                    )}
-                  >
-                    <span className="font-medium">{v.label}</span>
-                    <span className="text-xs text-muted-foreground">{v.description}</span>
-                  </button>
-                ))}
-              </div>
+              <p className="text-xs text-muted-foreground">
+                Speech runs on Hermes
+                {voiceCaps.sttProvider || voiceCaps.ttsProvider
+                  ? ` (${[voiceCaps.sttProvider && `stt: ${voiceCaps.sttProvider}`, voiceCaps.ttsProvider && `tts: ${voiceCaps.ttsProvider}`].filter(Boolean).join(", ")})`
+                  : ""}
+                . Change the voice or engine in <code className="text-[11px]">~/.hermes/config.yaml</code>.
+              </p>
             </div>
             )}
             <div className="p-3">
@@ -1247,9 +1234,15 @@ function ChatApp() {
   const { autoSpeak, toggleAutoSpeak } = useAutoSpeak();
   const voiceCaps = useVoiceCapabilities();
   const { theme, toggle: toggleTheme } = useTheme();
-  const { voice: ttsVoice, setVoice: setTtsVoice } = useTTSVoice();
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
   const autoSpeakRef = useRef(autoSpeak);
   autoSpeakRef.current = autoSpeak;
+  const voiceCapsRef = useRef(voiceCaps);
+  voiceCapsRef.current = voiceCaps;
+  const voiceModeRef = useRef(voiceMode);
+  voiceModeRef.current = voiceMode;
+  const speakReplyRef = useRef<(text: string) => void>(() => {});
   const [pendingGate, setPendingGate] = useState<Gate | null>(null);
   const [recoveryCandidate, setRecoveryCandidate] = useState<{ chatId: string; message: ChatMessage } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1800,6 +1793,8 @@ function ChatApp() {
         assistantContentRef.current +=
           "\n\n🚦 Hermes needs your input: " + (event.prompt || "");
         setPendingGate(gate);
+        // A decision is the user's to make by hand; don't keep the mic open.
+        setVoicePhase("idle");
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
@@ -1818,13 +1813,7 @@ function ChatApp() {
         );
         setIsRunning(false);
         updateBackendMessage(chatId, assistantId, assistantContentRef.current, assistantToolStepsRef.current, assistantReasoningRef.current).catch(() => {});
-        if (autoSpeakRef.current && voiceCaps.ttsAvailable && assistantContentRef.current.trim()) {
-          speakText(assistantContentRef.current, undefined, ttsVoice).then((url) => {
-            const audio = new Audio(url);
-            audio.onended = () => URL.revokeObjectURL(url);
-            audio.play().catch(() => {});
-          }).catch(() => {});
-        }
+        speakReplyRef.current(assistantContentRef.current);
       } else if (event.type === "status_update") {
         const kind = (event.kind || "").toLowerCase();
         const text = (event.text || "").trim();
@@ -2549,6 +2538,102 @@ function ChatApp() {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // Hands-free voice mode
+  //
+  // Mirrors Hermes' own voice mode: listen, submit on silence, speak the reply,
+  // listen again. The loop lives here rather than in the composer because
+  // re-arming the mic depends on the turn lifecycle and on playback finishing.
+  // ---------------------------------------------------------------------------
+  const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const {
+    recording: voiceRecording,
+    transcribing: voiceTranscribing,
+    start: startVoiceCapture,
+    cancel: cancelVoiceCapture,
+  } = useVoiceRecorder(
+    (text) => {
+      setVoicePhase("thinking");
+      runtime.thread.append({ role: "user", content: [{ type: "text", text }] });
+    },
+    {
+      autoStopOnSilence: true,
+      onIdle: () => setVoicePhase("idle"),
+      onError: (e) => {
+        setError((e as Error)?.message || "Voice input failed.");
+        voiceModeRef.current = false;
+        setVoiceMode(false);
+        setVoicePhase("idle");
+      },
+    }
+  );
+
+  // Listen again as soon as nothing else owns the conversation. Driven off
+  // state rather than callbacks so a missed hand-off can't leave the loop
+  // stalled; gates stay manual on purpose.
+  useEffect(() => {
+    if (!voiceMode || isRunning || pendingGate) return;
+    if (voiceRecording || voiceTranscribing || voicePhase === "speaking") return;
+    setVoicePhase("listening");
+    void startVoiceCapture();
+  }, [
+    voiceMode,
+    isRunning,
+    pendingGate,
+    voicePhase,
+    voiceRecording,
+    voiceTranscribing,
+    startVoiceCapture,
+  ]);
+
+  useEffect(() => {
+    if (voiceTranscribing) setVoicePhase("transcribing");
+  }, [voiceTranscribing]);
+
+  const speakReply = useCallback((text: string) => {
+    const body = text.trim();
+    const shouldSpeak =
+      Boolean(body) &&
+      voiceCapsRef.current.ttsAvailable &&
+      (voiceModeRef.current || autoSpeakRef.current);
+    if (!shouldSpeak) {
+      setVoicePhase("idle");
+      return;
+    }
+    if (voiceModeRef.current) setVoicePhase("speaking");
+    speakText(body)
+      .then((url) => {
+        const audio = new Audio(url);
+        voiceAudioRef.current = audio;
+        const done = () => {
+          URL.revokeObjectURL(url);
+          if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
+          setVoicePhase("idle");
+        };
+        audio.onended = done;
+        audio.onerror = done;
+        audio.play().catch(done);
+      })
+      .catch((e) => {
+        if (voiceModeRef.current) setError((e as Error).message);
+        setVoicePhase("idle");
+      });
+  }, []);
+  speakReplyRef.current = speakReply;
+
+  const toggleVoiceMode = useCallback(() => {
+    const next = !voiceModeRef.current;
+    // handleStreamEvent may read this before the next render.
+    voiceModeRef.current = next;
+    setVoiceMode(next);
+    if (next) return;
+    cancelVoiceCapture();
+    voiceAudioRef.current?.pause();
+    voiceAudioRef.current = null;
+    setVoicePhase("idle");
+  }, [cancelVoiceCapture]);
+
   // Empty aui root — starter chips are rendered from React state via Thread.
   const aui = useAui({});
 
@@ -2567,8 +2652,6 @@ function ChatApp() {
         onLogout={logout}
         theme={theme}
         onToggleTheme={toggleTheme}
-        ttsVoice={ttsVoice}
-        onTtsVoiceChange={setTtsVoice}
         voiceCaps={voiceCaps}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
@@ -2677,7 +2760,7 @@ function ChatApp() {
         )}
         <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
           <AssistantRuntimeProvider aui={aui} runtime={runtime}>
-            <Thread onUndo={handleUndo} onCompress={handleCompress} onBranch={handleBranch} contextWindow={contextWindow} threadUsage={threadUsage as any} autoSpeak={autoSpeak} onAutoSpeakToggle={toggleAutoSpeak} voiceCaps={voiceCaps} ttsVoice={ttsVoice} gatePending={Boolean(pendingGate)} onGateChoice={handleGateChoice} starterSuggestions={starterSuggestions} slashCommands={slashCommands} composerDraft={composerDraft} onComposerDraftConsumed={() => setComposerDraft(null)} />
+            <Thread onUndo={handleUndo} onCompress={handleCompress} onBranch={handleBranch} contextWindow={contextWindow} threadUsage={threadUsage as any} autoSpeak={autoSpeak} onAutoSpeakToggle={toggleAutoSpeak} voiceCaps={voiceCaps} voiceMode={voiceMode} voicePhase={voicePhase} onVoiceModeToggle={toggleVoiceMode} gatePending={Boolean(pendingGate)} onGateChoice={handleGateChoice} starterSuggestions={starterSuggestions} slashCommands={slashCommands} composerDraft={composerDraft} onComposerDraftConsumed={() => setComposerDraft(null)} />
           </AssistantRuntimeProvider>
         </div>
         <ModelPicker

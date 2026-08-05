@@ -27,12 +27,10 @@ REQUIRED_PACKAGES = [
     ("bcrypt", "bcrypt>=4.1"),
 ]
 
-OPTIONAL_PACKAGES = [
-    ("edge_tts", "edge-tts>=6.1", "Voice output fallback (text-to-speech)"),
-    ("faster_whisper", "faster-whisper>=1.0", "Voice input fallback (speech-to-text)"),
-    ("imageio_ffmpeg", "imageio-ffmpeg>=0.5", "Audio conversion (ffmpeg)"),
-    ("langdetect", "langdetect>=1.0", "Automatic language detection"),
-]
+# Voice is served by Hermes' own STT/TTS providers (`hermes-agent[voice]` plus
+# `stt.` / `tts.` in ~/.hermes/config.yaml), so the plugin has no optional
+# speech dependencies of its own. See docs/hermes-voice.md.
+OPTIONAL_PACKAGES: list[tuple[str, str, str]] = []
 
 
 def check_dependencies() -> list[str]:

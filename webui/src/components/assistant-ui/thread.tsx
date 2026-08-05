@@ -41,6 +41,7 @@ import {
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  AudioLinesIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -65,7 +66,22 @@ import { getToken, type SlashCommandEntry } from "../../api";
 import { useVoiceRecorder } from "../../hooks/useVoiceRecorder";
 import type { VoiceCapabilities } from "../../hooks/useVoiceCapabilities";
 
-const VoiceCapsContext = createContext<VoiceCapabilities>({ ttsAvailable: true, sttAvailable: true, ttsVoice: undefined });
+const VoiceCapsContext = createContext<VoiceCapabilities>({ ttsAvailable: true, sttAvailable: true });
+
+/** Where the hands-free voice loop currently is. Owned by App. */
+export type VoicePhase = "idle" | "listening" | "transcribing" | "thinking" | "speaking";
+
+type VoiceModeContextValue = {
+  active: boolean;
+  phase: VoicePhase;
+  onToggle: (() => void) | null;
+};
+
+const VoiceModeContext = createContext<VoiceModeContextValue>({
+  active: false,
+  phase: "idle",
+  onToggle: null,
+});
 
 export type StarterSuggestion = {
   title: string;
@@ -301,7 +317,9 @@ export const Thread: FC<{
   autoSpeak?: boolean;
   onAutoSpeakToggle?: () => void;
   voiceCaps?: VoiceCapabilities;
-  ttsVoice?: string;
+  voiceMode?: boolean;
+  voicePhase?: VoicePhase;
+  onVoiceModeToggle?: () => void;
   gatePending?: boolean;
   onGateChoice?: (choice: string) => Promise<boolean>;
   starterSuggestions?: StarterSuggestion[];
@@ -317,7 +335,9 @@ export const Thread: FC<{
   autoSpeak,
   onAutoSpeakToggle,
   voiceCaps,
-  ttsVoice,
+  voiceMode = false,
+  voicePhase = "idle",
+  onVoiceModeToggle,
   gatePending = false,
   onGateChoice,
   starterSuggestions = [],
@@ -325,15 +345,20 @@ export const Thread: FC<{
   composerDraft = null,
   onComposerDraftConsumed,
 }) => {
-  const caps = { ...(voiceCaps ?? { ttsAvailable: true, sttAvailable: true }), ttsVoice };
+  const caps = voiceCaps ?? { ttsAvailable: true, sttAvailable: true };
   const isEmpty = useAuiState(isNewChatView);
   const commands = slashCommands.length > 0 ? slashCommands : FALLBACK_SLASH_COMMANDS;
+  const voiceModeValue = useMemo(
+    () => ({ active: voiceMode, phase: voicePhase, onToggle: onVoiceModeToggle ?? null }),
+    [voiceMode, voicePhase, onVoiceModeToggle]
+  );
 
   return (
     <StarterSuggestionsContext.Provider value={starterSuggestions}>
     <SlashCommandsContext.Provider value={commands}>
     <GateContext.Provider value={{ gatePending, onGateChoice: onGateChoice ?? null }}>
     <VoiceCapsContext.Provider value={caps}>
+    <VoiceModeContext.Provider value={voiceModeValue}>
     <ThreadPrimitive.Root
       className="aui-root aui-thread-root bg-background @container flex h-full flex-col"
       style={{
@@ -398,6 +423,7 @@ export const Thread: FC<{
         </div>
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
+    </VoiceModeContext.Provider>
     </VoiceCapsContext.Provider>
     </GateContext.Provider>
     </SlashCommandsContext.Provider>
@@ -649,11 +675,25 @@ const ComposerAction: FC<{
 
   const { recording, transcribing, start, stop } = useVoiceRecorder(handleTranscript);
   const voiceCaps = useContext(VoiceCapsContext);
+  const voiceMode = useContext(VoiceModeContext);
 
   const handleMicClick = () => {
     if (recording) stop();
     else start();
   };
+
+  // Hands-free mode drives its own recorder from App, so stand the manual
+  // push-to-talk mic down while it runs.
+  const handsFree = voiceMode.active;
+  const handsFreeTooltip = handsFree
+    ? {
+        idle: "Voice mode on — waiting",
+        listening: "Listening… stop talking to send",
+        transcribing: "Transcribing…",
+        thinking: "Hermes is thinking…",
+        speaking: "Hermes is speaking…",
+      }[voiceMode.phase]
+    : "Voice mode (hands-free)";
 
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
@@ -727,7 +767,30 @@ const ComposerAction: FC<{
             <Undo2Icon className="size-4" />
           </TooltipIconButton>
         )}
-        {voiceCaps.sttAvailable && <TooltipIconButton
+        {voiceMode.onToggle && voiceCaps.sttAvailable && voiceCaps.ttsAvailable && (
+          <TooltipIconButton
+            tooltip={handsFreeTooltip}
+            side="bottom"
+            type="button"
+            variant="ghost"
+            size="icon"
+            className={cn("size-7 rounded-full", handsFree && "text-primary")}
+            aria-label={handsFree ? "Turn off voice mode" : "Turn on voice mode"}
+            aria-pressed={handsFree}
+            onClick={voiceMode.onToggle}
+          >
+            {handsFree && voiceMode.phase === "listening" ? (
+              <DotMatrix state="recording" label="Listening" className="size-4" />
+            ) : handsFree && voiceMode.phase === "speaking" ? (
+              <DotMatrix state="speaking" label="Hermes is speaking" className="size-4" />
+            ) : handsFree && (voiceMode.phase === "thinking" || voiceMode.phase === "transcribing") ? (
+              <DotMatrix state="listening" label="Working" className="size-4" />
+            ) : (
+              <AudioLinesIcon className="size-4" />
+            )}
+          </TooltipIconButton>
+        )}
+        {voiceCaps.sttAvailable && !handsFree && <TooltipIconButton
           tooltip={recording ? "Stop recording" : transcribing ? "Transcribing..." : "Voice input"}
           side="bottom"
           type="button"
@@ -1064,7 +1127,7 @@ const AssistantActionBar: FC = () => {
     try {
       const { speakText } = await import("../../api");
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-      const url = await speakText(messageText, undefined, voiceCaps.ttsVoice);
+      const url = await speakText(messageText);
       audioUrlRef.current = url;
       const audio = new Audio(url);
       audioRef.current = audio;
