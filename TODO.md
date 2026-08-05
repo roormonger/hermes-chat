@@ -41,14 +41,16 @@ Ordered by “feels like CLI/desktop” impact:
 
 ## 🟡 Voice — replace the workaround with Hermes
 
-Today: plugin-owned Whisper STT + Edge TTS (`hermes_chat/voice.py`, `/v1/audio/*`). Native Hermes (v2026.8.3+) has streaming TTS, barge-in, wake words, unified STT/TTS on CLI/desktop/gateways.
+Today: `/v1/audio/*` prefers Hermes `tools.tts_tool` / `transcription_tools` (Desktop parity); falls back to plugin Edge + Whisper. Native gateway `voice.*` remains host-audio only.
 
-- [ ] **Research: how native voice attaches to `tui_gateway` / sessions** — Find the RPC, events, or shared APIs desktop/CLI use. Document in `docs/` what a browser client must call (and what stays desktop-only: wake word, full-duplex mic ownership, etc.).
-- [ ] **Spike: one turn of Hermes TTS (or STT) through our chat path** — Prove audio can ride the same session as text/tools/gates without Edge/Whisper.
-- [ ] **Replace plugin TTS/STT** — Swap auto-speak / Read aloud / mic input to Hermes providers; delete or gate `voice.py` once parity is good enough.
-- [ ] **Stretch: conversational voice in the web UI** — Streaming clause TTS + barge-in only if the gateway exposes it for non-desktop clients; don’t fake it in the browser.
+Research: [`docs/hermes-voice.md`](docs/hermes-voice.md)
 
-Until the research item lands, keep the current voice stack; don’t expand it.
+- [x] **Research: how native voice attaches to `tui_gateway` / sessions** — Gateway `voice.toggle` / `voice.record` / `voice.tts` + events are **host mic/speakers**. Browser-shaped path is Desktop `POST /api/audio/transcribe|speak` → Hermes tools.
+- [x] **Spike: one turn of Hermes TTS (or STT) through our chat path** — `hermes_chat/voice.py` calls Hermes providers first; `/v1/audio/speak` + `/transcribe` keep the same UI contract; `voice-config` reports `tts_backend` / `stt_backend` (`hermes`|`plugin`|`none`).
+- [ ] **Replace plugin TTS/STT** — Drop or hard-gate Edge/Whisper fallback once Hermes path is reliable in prod; align dashboard “Install Voice” with Hermes `[voice]` extras.
+- [ ] **Stretch: conversational voice in the web UI** — Streaming clause TTS + barge-in only as **browser-local** playback control; don’t expect gateway streaming or barge RPCs.
+
+Until replace lands, keep the plugin fallback; don’t expand it.
 
 ---
 

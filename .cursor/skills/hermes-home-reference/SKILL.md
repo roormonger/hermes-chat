@@ -55,7 +55,10 @@ hermes-chat uses **TUI gateway** — same surface as the Ink TUI — via **in-pr
 - Attachments: `image.attach` / `image.attach_bytes` / `pdf.attach` / `file.attach`
   (web: `POST /v1/image/attach`, `/v1/pdf/attach`, `/v1/file/attach` — file refs go into the prompt)
 - Gates: `approval.respond`, `clarify.respond`, `sudo.respond`, `secret.respond`
-- Skip for web: `terminal.read.respond` (desktop PTY)
+- Voice: `voice.toggle` / `voice.record` / `voice.tts` + `voice.status` / `voice.transcript`
+  are **host mic/speakers** — not for remote browsers. Web path = Desktop-style
+  `/api/audio/*` → `tools.tts_tool` / `transcription_tools` (see `docs/hermes-voice.md`).
+- Skip for web: `terminal.read.respond` (desktop PTY); host `voice.record` / `voice.tts` playback
 
 ### Events we care about
 

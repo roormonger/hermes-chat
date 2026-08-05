@@ -1607,20 +1607,25 @@ class SpeakRequest(BaseModel):
 @app.get("/api/plugins/hermes-chat/voice-config")
 async def get_voice_config(current_user: dict = Depends(get_current_user)) -> dict:
     cfg = load_config()
+    from . import voice as voice_mod
+
+    hermes_tts = voice_mod.hermes_tts_available()
+    hermes_stt = voice_mod.hermes_stt_available()
+    plugin_tts = voice_mod.plugin_tts_available()
+    plugin_stt = voice_mod.plugin_stt_available()
     return {
         "voice_enabled": cfg.voice_enabled,
         "default_tts_voice": cfg.default_tts_voice,
-        "tts_available": importlib.util.find_spec("edge_tts") is not None,
-        "stt_available": (
-            importlib.util.find_spec("faster_whisper") is not None
-            and importlib.util.find_spec("imageio_ffmpeg") is not None
-        ),
+        "tts_available": hermes_tts or plugin_tts,
+        "stt_available": hermes_stt or plugin_stt,
+        "tts_backend": "hermes" if hermes_tts else ("plugin" if plugin_tts else "none"),
+        "stt_backend": "hermes" if hermes_stt else ("plugin" if plugin_stt else "none"),
     }
 
 
 @app.post("/v1/audio/transcribe")
 async def transcribe_audio(file: UploadFile, current_user: dict = Depends(get_current_user)) -> dict:
-    """Transcribe uploaded audio (webm/opus from browser) to text via Whisper."""
+    """Transcribe uploaded audio (webm/opus from browser) via Hermes STT (plugin fallback)."""
     if not load_config().voice_enabled:
         raise HTTPException(status_code=503, detail="Voice is disabled in settings.")
     import shutil
@@ -1633,8 +1638,13 @@ async def transcribe_audio(file: UploadFile, current_user: dict = Depends(get_cu
     try:
         from .voice import transcribe
 
-        text = transcribe(tmp_path)
-        return {"text": text}
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, transcribe, tmp_path)
+        return {
+            "text": result["text"],
+            "provider": result.get("provider"),
+            "source": result.get("source"),
+        }
     except ImportError as e:
         logger.error("Voice dependencies not installed: %s", e)
         raise HTTPException(status_code=503, detail="Voice support not installed. Install dependencies via the dashboard → Install Voice button.")
@@ -1647,7 +1657,7 @@ async def transcribe_audio(file: UploadFile, current_user: dict = Depends(get_cu
 
 @app.post("/v1/audio/speak")
 async def speak_text(request: SpeakRequest, current_user: dict = Depends(get_current_user)) -> FileResponse:
-    """Synthesize speech from text via Piper TTS. Returns a wav audio file."""
+    """Synthesize speech via Hermes TTS providers (plugin Edge fallback). Returns audio file."""
     if not load_config().voice_enabled:
         raise HTTPException(status_code=503, detail="Voice is disabled in settings.")
     if request.voice is None:
@@ -1655,11 +1665,20 @@ async def speak_text(request: SpeakRequest, current_user: dict = Depends(get_cur
     try:
         from .voice import synthesize
 
-        wav_path = await synthesize(request.text, lang=request.lang, voice=request.voice)
-        media_type = "audio/mpeg" if str(wav_path).endswith(".mp3") else "audio/wav"
-        filename = "speech.mp3" if str(wav_path).endswith(".mp3") else "speech.wav"
+        result = await synthesize(request.text, lang=request.lang, voice=request.voice)
+        audio_path = Path(result["path"])
+        media_type = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav"
+        if audio_path.suffix.lower() == ".ogg":
+            media_type = "audio/ogg"
+        elif audio_path.suffix.lower() == ".flac":
+            media_type = "audio/flac"
+        filename = f"speech{audio_path.suffix or '.mp3'}"
+        logger.info(
+            "TTS source=%s provider=%s path=%s",
+            result.get("source"), result.get("provider"), audio_path.name,
+        )
         return FileResponse(
-            str(wav_path),
+            str(audio_path),
             media_type=media_type,
             filename=filename,
             background=None,

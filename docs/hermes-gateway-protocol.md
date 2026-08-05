@@ -355,9 +355,25 @@ Wired in hermes-chat:
 
 Local-only: `/new`, `/clear` start a new chat in the web UI.
 
+## Voice (see `docs/hermes-voice.md`)
+
+Gateway RPCs exist but are **host-audio** (not for remote browsers):
+
+- `voice.toggle` / `voice.record` / `voice.tts`
+- Events: `voice.status`, `voice.transcript` → TUI auto-`prompt.submit`
+
+Browser-correct path (Desktop): Hermes `hermes_cli/web_server.py`
+`POST /api/audio/transcribe` + `POST /api/audio/speak` →
+`tools.transcription_tools` / `tools.tts_tool` → bytes/`data_url`.
+hermes-chat `/v1/audio/*` prefers Hermes `tools.tts_tool` /
+`tools.transcription_tools` (same as Desktop); plugin Edge/Whisper is fallback.
+`GET .../voice-config` reports `tts_backend` / `stt_backend`.
+
 ## Open items / not yet investigated
 
 - Session tools: ~~`session.branch` / `session.compress` / richer undo~~ done
   (`POST /v1/chat/compress`, `POST /v1/chat/branch`; undo returns `prefill`).
 - TUI session import: ~~`session.list` + `session.resume` picker~~ done
   (`GET /v1/hermes-sessions`, `POST /v1/hermes-sessions/import`).
+- Voice research: ~~done~~ → spike Hermes TTS/STT on `/v1/audio/*`
+  (`docs/hermes-voice.md`) ~~done~~ (Hermes-first + plugin fallback).
