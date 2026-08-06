@@ -13,15 +13,31 @@ function readStored(): boolean {
 export function useAutoSpeak() {
   const [enabled, setEnabled] = useState<boolean>(readStored);
 
+  const persist = useCallback((next: boolean) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, String(next));
+    } catch {
+      /* ignore */
+    }
+    setEnabled(next);
+  }, []);
+
   const toggle = useCallback(() => {
     setEnabled((prev) => {
       const next = !prev;
       try {
         localStorage.setItem(STORAGE_KEY, String(next));
-      } catch {}
+      } catch {
+        /* ignore */
+      }
       return next;
     });
   }, []);
 
-  return { autoSpeak: enabled, toggleAutoSpeak: toggle };
+  return {
+    autoSpeak: enabled,
+    toggleAutoSpeak: toggle,
+    /** Force on — used when entering voice mode so replies always speak. */
+    enableAutoSpeak: () => persist(true),
+  };
 }

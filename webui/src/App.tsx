@@ -32,6 +32,7 @@ import { useAutoSpeak } from "./hooks/useAutoSpeak";
 import { useVoiceCapabilities, type VoiceCapabilities } from "./hooks/useVoiceCapabilities";
 import { useTheme } from "./hooks/useTheme";
 import { useVoiceRecorder } from "./hooks/useVoiceRecorder";
+import { startAudioPlayback, unlockAudioPlayback } from "./lib/audio-playback";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1231,7 +1232,7 @@ function ChatApp() {
   const [currentChatId, setCurrentChatId] = useState<string | null>(() => chatIdFromPath());
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
-  const { autoSpeak, toggleAutoSpeak } = useAutoSpeak();
+  const { autoSpeak, toggleAutoSpeak, enableAutoSpeak } = useAutoSpeak();
   const voiceCaps = useVoiceCapabilities();
   const { theme, toggle: toggleTheme } = useTheme();
   const [voiceMode, setVoiceMode] = useState(false);
@@ -2593,27 +2594,42 @@ function ChatApp() {
 
   const speakReply = useCallback((text: string) => {
     const body = text.trim();
+    // Voice mode always speaks — auto-speak is only for typed turns outside voice mode.
+    const inVoice = voiceModeRef.current;
     const shouldSpeak =
       Boolean(body) &&
       voiceCapsRef.current.ttsAvailable &&
-      (voiceModeRef.current || autoSpeakRef.current);
+      (inVoice || autoSpeakRef.current);
     if (!shouldSpeak) {
       setVoicePhase("idle");
       return;
     }
-    if (voiceModeRef.current) setVoicePhase("speaking");
+    if (inVoice) setVoicePhase("speaking");
+    // Stop any previous reply before starting a new one.
+    voiceAudioRef.current?.pause();
+    voiceAudioRef.current = null;
     speakText(body)
-      .then((url) => {
-        const audio = new Audio(url);
-        voiceAudioRef.current = audio;
-        const done = () => {
+      .then(async (url) => {
+        try {
+          const audio = await startAudioPlayback(url);
+          voiceAudioRef.current = audio;
+          const done = () => {
+            URL.revokeObjectURL(url);
+            if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
+            setVoicePhase("idle");
+          };
+          audio.onended = done;
+          audio.onerror = () => {
+            done();
+            if (voiceModeRef.current) setError("Audio playback failed.");
+          };
+        } catch (e) {
           URL.revokeObjectURL(url);
-          if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
+          if (voiceModeRef.current || autoSpeakRef.current) {
+            setError((e as Error).message || "Could not play reply audio.");
+          }
           setVoicePhase("idle");
-        };
-        audio.onended = done;
-        audio.onerror = done;
-        audio.play().catch(done);
+        }
       })
       .catch((e) => {
         if (voiceModeRef.current) setError((e as Error).message);
@@ -2627,12 +2643,19 @@ function ChatApp() {
     // handleStreamEvent may read this before the next render.
     voiceModeRef.current = next;
     setVoiceMode(next);
-    if (next) return;
+    if (next) {
+      // Unlock autoplay on this click so the later reply can actually play,
+      // and fold auto-speak into voice mode so a separate toggle isn't required.
+      unlockAudioPlayback();
+      enableAutoSpeak();
+      autoSpeakRef.current = true;
+      return;
+    }
     cancelVoiceCapture();
     voiceAudioRef.current?.pause();
     voiceAudioRef.current = null;
     setVoicePhase("idle");
-  }, [cancelVoiceCapture]);
+  }, [cancelVoiceCapture, enableAutoSpeak]);
 
   // Empty aui root — starter chips are rendered from React state via Thread.
   const aui = useAui({});

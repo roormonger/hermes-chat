@@ -67,7 +67,7 @@ export function useVoiceRecorder(
     if (!AudioCtx) return;
 
     const {
-      silenceMs = 1500,
+      silenceMs = 1100,
       noSpeechTimeoutMs = 7000,
       maxDurationMs = 60000,
     } = optionsRef.current;

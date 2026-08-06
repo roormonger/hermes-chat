@@ -62,7 +62,8 @@ import {
 } from "lucide-react";
 import { type FC, type ReactNode, useState, useCallback, useEffect, useRef, Children, createContext, useContext, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { getToken, type SlashCommandEntry } from "../../api";
+import { getToken, speakText, type SlashCommandEntry } from "../../api";
+import { startAudioPlayback } from "../../lib/audio-playback";
 import { useVoiceRecorder } from "../../hooks/useVoiceRecorder";
 import type { VoiceCapabilities } from "../../hooks/useVoiceCapabilities";
 
@@ -699,7 +700,7 @@ const ComposerAction: FC<{
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
       <div className="flex items-center gap-1">
         {!gatePending && <ComposerAddAttachment />}
-        {onAutoSpeakToggle && voiceCaps.ttsAvailable && (
+        {onAutoSpeakToggle && voiceCaps.ttsAvailable && !handsFree && (
           <TooltipIconButton
             tooltip={autoSpeak ? "Auto-speak on (click to turn off)" : "Auto-speak off (click to turn on)"}
             side="top"
@@ -712,6 +713,17 @@ const ComposerAction: FC<{
           >
             {autoSpeak ? <Volume2Icon className="size-4" /> : <VolumeXIcon className="size-4" />}
           </TooltipIconButton>
+        )}
+        {handsFree && (
+          <span className="text-muted-foreground text-xs tabular-nums px-1" aria-live="polite">
+            {{
+              idle: "Voice mode",
+              listening: "Listening…",
+              transcribing: "Transcribing…",
+              thinking: "Thinking…",
+              speaking: "Speaking…",
+            }[voiceMode.phase]}
+          </span>
         )}
       </div>
       <div className="flex items-center gap-1.5">
@@ -769,12 +781,12 @@ const ComposerAction: FC<{
         )}
         {voiceMode.onToggle && voiceCaps.sttAvailable && voiceCaps.ttsAvailable && (
           <TooltipIconButton
-            tooltip={handsFreeTooltip}
+            tooltip={handsFree ? `${handsFreeTooltip} (click to exit)` : "Voice mode — listen, speak replies, repeat"}
             side="bottom"
             type="button"
             variant="ghost"
             size="icon"
-            className={cn("size-7 rounded-full", handsFree && "text-primary")}
+            className={cn("size-7 rounded-full", handsFree && "text-primary bg-primary/10")}
             aria-label={handsFree ? "Turn off voice mode" : "Turn on voice mode"}
             aria-pressed={handsFree}
             onClick={voiceMode.onToggle}
@@ -1125,15 +1137,13 @@ const AssistantActionBar: FC = () => {
     if (!messageText?.trim()) return;
     setSpeaking(true);
     try {
-      const { speakText } = await import("../../api");
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
       const url = await speakText(messageText);
       audioUrlRef.current = url;
-      const audio = new Audio(url);
+      const audio = await startAudioPlayback(url);
       audioRef.current = audio;
       audio.onended = () => setSpeaking(false);
       audio.onerror = () => setSpeaking(false);
-      await audio.play();
     } catch (e) {
       console.error("TTS failed:", e);
       setSpeaking(false);
